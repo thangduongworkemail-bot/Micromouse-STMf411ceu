@@ -53,3 +53,8 @@ dkms.conf
 
 # debug information files
 *.dwo
+# STM32CubeIDE Specific
+Debug/
+Release/
+.settings/
+*.launch
