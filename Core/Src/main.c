@@ -8,6 +8,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -339,6 +340,7 @@ int main(void)
   MX_TIM5_Init();
   MX_TIM4_Init();
   MX_TIM9_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   // 1. Kích hoạt ADC ở chế độ DMA trước để nó nằm vùng chờ tín hiệu
   // Kích Hoạt Tim4 nguồn trig cho DMA ADC 5khz
