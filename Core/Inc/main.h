@@ -41,7 +41,8 @@ extern "C" {
 
 /* Exported constants --------------------------------------------------------*/
 /* USER CODE BEGIN EC */
-
+// Chu kỳ ngắt TIM9 (500Hz): nhịp chung của vòng vận tốc (pid.c) và đọc IMU (mpu6500.c)
+#define CONTROL_DT            0.002f
 /* USER CODE END EC */
 
 /* Exported macro ------------------------------------------------------------*/
@@ -55,7 +56,13 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+// In qua USB CDC (main.c). Chỉ gọi ở luồng chính, KHÔNG gọi trong ngắt/callback HAL
+void CDC_Print(const char *str);
+void CDC_WaitHost(void);
+// In / nhận qua USART1 (HC-05, main.c). Chỉ gọi ở luồng chính
+void UART_Print(const char *str);
+void UART_WaitStart(const char *prompt);  // Chờ nhận 1 ký tự bất kỳ, in prompt mỗi 2s
+int  UART_ReadLine(char *buf, int size, uint32_t timeout_ms);  // 1 dòng (bỏ dòng trống), -1 = hết giờ
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

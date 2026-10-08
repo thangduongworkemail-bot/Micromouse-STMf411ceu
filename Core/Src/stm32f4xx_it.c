@@ -62,14 +62,7 @@ extern I2C_HandleTypeDef hi2c1;
 extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim9;
 /* USER CODE BEGIN EV */
-extern uint16_t prev_cnt_left ;
-extern uint16_t prev_cnt_right ;
-extern float speed_left_ms ;
-extern float speed_right_ms ;
-extern int32_t speed_left_int_uMs ;
-extern int32_t speed_right_int_uMs ;
-extern uint8_t imu_rx_buffer[14];
-#define MPU6050_ADDR          (0x68 << 1)
+// Không xử lý gì ở đây: các handler chỉ gọi HAL, HAL gọi callback trong main.c / mpu6500.c
 /* USER CODE END EV */
 
 /******************************************************************************/

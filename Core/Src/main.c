@@ -12,17 +12,18 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "usbd_cdc_if.h"    // CDC_Transmit_FS, USBD_CDC_HandleTypeDef
+#include "mpu6500.h"        // IMU
+#include "adc.h"            // cảm biến hồng ngoại
+#include "pid.h"            // động cơ + encoder + PID vận tốc
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,40 +45,10 @@ TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim5;
 TIM_HandleTypeDef htim9;
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
-// MPU6500 SETTING
-#define MPU6050_ADDR          (0x68 << 1) // Địa chỉ I2C 8-bit (0xD0) nếu AD0 nối GND
-#define REG_SMPLRT_DIV        0x19        // Sample Rate Divider
-#define REG_CONFIG            0x1A        // Cấu hình DLPF & FSYNC
-#define REG_GYRO_CONFIG       0x1B        // Dải đo Gyro
-#define REG_ACCEL_CONFIG      0x1C        // Dải đo Accel
-#define REG_PWR_MGMT_1        0x6B        // Quản lý nguồn & Clock Source
-// gyro và gia tốc accel
-uint8_t imu_rx_buffer[14];
-int16_t Accel_X_RAW = 0, Accel_Y_RAW = 0, Accel_Z_RAW = 0;
-  int16_t Gyro_X_RAW = 0,  Gyro_Y_RAW = 0,  Gyro_Z_RAW = 0;
-  float Ax, Ay, Az;
-    float Gx, Gy, Gz;
-    float gyro_x_offset = 0.0f;
-    float gyro_y_offset = 0.0f;
-    float gyro_z_offset = 0.0f;
-    float pitch_angle = 0.0f; // Góc ngóc đầu/chúi mũi
-    float roll_angle = 0.0f;  // Góc lật nghiêng xe
-    float yaw_angle = 0.0f;
-// Thêm từ khóa volatile để báo cho CPU biết mảng này bị thay đổi ngầm bởi DMA
-volatile uint16_t adc_value[5];
-// Biến Gửi mẫu USB Device
-char msg[200];
-//
-// proces Data CNT encoder
-uint16_t prev_cnt_left = 0;
-uint16_t prev_cnt_right = 0;
-// Vận Tốc Bánh
-float speed_left_ms = 0.0f;
-float speed_right_ms = 0.0f;
-int32_t speed_left_int_uMs = 0;
- int32_t speed_right_int_uMs = 0;
-//
+extern USBD_HandleTypeDef hUsbDeviceFS;   // khai báo trong usb_device.c
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -92,208 +63,83 @@ static void MX_TIM3_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM9_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 // Hàm gửi dữ liệu qua CDC
+// Không bao giờ treo chương trình khi chưa cắm USB hoặc máy tính chưa mở cổng COM:
+//   - chưa cắm USB (chưa enumerate): bỏ qua luôn (pClassData = NULL, CDC_Transmit_FS sẽ đọc rác)
+//   - máy tính không đọc: chờ tối đa 20ms rồi bỏ dòng này; các dòng sau bỏ ngay cho tới khi máy tính đọc lại
+// Trước đây hàm này chờ vô hạn -> xe chạy pin không cắm USB sẽ đứng im ở lần in đầu tiên
 void CDC_Print(const char *str) {
-    uint8_t len = (uint8_t)strlen(str);
+    static uint8_t host_stalled = 0;
+    if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) return;
+    uint16_t len = (uint16_t)strlen(str);
+    uint32_t start = HAL_GetTick();
     while (CDC_Transmit_FS((uint8_t*)str, len) == USBD_BUSY) {
-        HAL_Delay(1);
-    }
-}
-// MPU6500
-// Tìm Địa Chỉ
-
-void I2C_ScanAndPrint_CDC(void) {
-    HAL_StatusTypeDef result;
-    uint8_t count = 0;
-
-    CDC_Print("\r\n===============================\r\n");
-    CDC_Print("   Bat dau quet bus I2C...\r\n");
-    CDC_Print("===============================\r\n");
-
-    // Dải địa chỉ I2C 7-bit tiêu chuẩn từ 0x01 đến 0x77 (1 đến 119)
-    for (uint8_t addr_7bit = 1; addr_7bit < 128; addr_7bit++) {
-        // Địa chỉ đưa vào HAL cần dịch trái 1 bit (addr_7bit << 1)
-        result = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr_7bit << 1), 2, 5);
-
-        if (result == HAL_OK) {
-            // Định dạng chuỗi in ra địa chỉ Hex
-            snprintf(msg, sizeof(msg),
-                     "[+] Tim thay thiet bi tai dia chi: 0x%02X\r\n", addr_7bit);
-            CDC_Print(msg);
-
-            // Kiểm tra xem có đúng là MPU-6500 hay không
-            if (addr_7bit == 0x68 || addr_7bit == 0x69) {
-                snprintf(msg, sizeof(msg),
-                         "    -> Co the la MPU-6050 (AD0=%s)\r\n",
-                         (addr_7bit == 0x68) ? "GND" : "VCC");
-                CDC_Print(msg);
-            }
-
-            count++;
+        if (host_stalled || HAL_GetTick() - start > 20) {
+            host_stalled = 1;
+            return;
         }
     }
-
-    if (count == 0) {
-        CDC_Print("[-] Khong tim thay thiet bi nao tren bus I2C!\r\n");
-    } else {
-        snprintf(msg, sizeof(msg),
-                 "[*] Hoan thanh! Tong so thiet bi tim thay: %d\r\n", count);
-        CDC_Print(msg);
-    }
-    CDC_Print("===============================\r\n\r\n");
+    host_stalled = 0;
 }
-// khởi tạo MPU6500
-HAL_StatusTypeDef MPU6500_Init(void) {
-    uint8_t data[2];
-    HAL_StatusTypeDef status;
-
-    // 1. Thoát Sleep Mode, dùng PLL trục Gyro X làm clock reference
-    data[0] = 0x6B; // REG_PWR_MGMT_1
-    data[1] = 0x01;
-    status = HAL_I2C_Master_Transmit(&hi2c1, MPU6050_ADDR, data, 2, 100);
-    if (status != HAL_OK) return status;
-    HAL_Delay(10);
-
-    // 2. Cấu hình DLPF = 3 (Băng thông 41Hz)
-    // Giảm delay xuống ~5.9ms, đủ nhạy để PID bám tường mà vẫn lọc được nhiễu rung cơ khí
-    data[0] = 0x1A; // REG_CONFIG
-    data[1] = 0x03;
-    status = HAL_I2C_Master_Transmit(&hi2c1, MPU6050_ADDR, data, 2, 100);
-    if (status != HAL_OK) return status;
-
-    // 3. Tốc độ lấy mẫu (Sample Rate) = 1kHz / (1 + 4) = 200 Hz
-    // Tốc độ 200Hz là dư sức cho vòng lặp PID 100Hz (10ms) của xe
-    data[0] = 0x19; // REG_SMPLRT_DIV
-    data[1] = 0x04;
-    status = HAL_I2C_Master_Transmit(&hi2c1, MPU6050_ADDR, data, 2, 100);
-    if (status != HAL_OK) return status;
-
-    // 4. Accel Full Scale: ±2g -> Độ nhạy 16384 LSB/g (Xe chạy mặt phẳng không cần lớn)
-    data[0] = 0x1C; // REG_ACCEL_CONFIG
-    data[1] = 0x00;
-    status = HAL_I2C_Master_Transmit(&hi2c1, MPU6050_ADDR, data, 2, 100);
-    if (status != HAL_OK) return status;
-
-    // 5. Gyro Full Scale: ±2000 deg/s -> Độ nhạy 16.4 LSB/(deg/s)
-    // BẮT BUỘC dùng thang đo lớn nhất vì Micromouse xoay rất gắt
-    data[0] = 0x1B; // REG_GYRO_CONFIG
-    data[1] = 0x18;
-    status = HAL_I2C_Master_Transmit(&hi2c1, MPU6050_ADDR, data, 2, 100);
-    if (status != HAL_OK) return status;
-
-    return HAL_OK;
-}
-void MPU6500_Read_All(void) {
-    uint8_t buffer[14];
-    HAL_StatusTypeDef status;
-
-    // Đọc liên tiếp 14 byte từ địa chỉ 0x3B (ACCEL_XOUT_H)
-    status = HAL_I2C_Mem_Read(&hi2c1, (0x68 << 1), 0x3B, I2C_MEMADD_SIZE_8BIT, buffer, 14, 100);
-
-    if (status == HAL_OK) {
-        Accel_X_RAW = (int16_t)((buffer[0] << 8) | buffer[1]);
-        Accel_Y_RAW = (int16_t)((buffer[2] << 8) | buffer[3]);
-        Accel_Z_RAW = (int16_t)((buffer[4] << 8) | buffer[5]);
-        // buffer[6] và buffer[7] là nhiệt độ (TEMP_OUT)
-        Gyro_X_RAW  = (int16_t)((buffer[8]  << 8) | buffer[9]);
-        Gyro_Y_RAW  = (int16_t)((buffer[10] << 8) | buffer[11]);
-        Gyro_Z_RAW  = (int16_t)((buffer[12] << 8) | buffer[13]);
-    } else {
-        CDC_Print("Loi doc I2C tu MPU6050!\r\n");
+// Chờ tới khi máy tính thật sự đọc dữ liệu USB (đã cắm cáp VÀ mở cổng COM trong phần mềm terminal):
+// gửi 1 dòng trống, máy tính đọc xong trong 100ms nghĩa là cổng đã mở. Gọi ở luồng chính, không gọi trong ngắt.
+void CDC_WaitHost(void)
+{
+    while (1) {
+        if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED &&
+            CDC_Transmit_FS((uint8_t*)"\r\n", 2) == USBD_OK) {
+            USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
+            uint32_t start = HAL_GetTick();
+            while (HAL_GetTick() - start < 100) {
+                if (hcdc->TxState == 0) return;
+            }
+        }
+        HAL_Delay(200);
     }
 }
-void MPU6500_Calibrate(void) {
-    uint8_t raw_data[6];
-    long sum_gx = 0, sum_gy = 0, sum_gz = 0;
-    const int samples = 500;
-
-    for (int i = 0; i < samples; i++) {
-        // Đọc trực tiếp 6 byte thanh ghi Gyro (0x43 đến 0x48)
-        HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x43, 1, raw_data, 6, 100);
-
-        sum_gx += (int16_t)((raw_data[0] << 8) | raw_data[1]);
-        sum_gy += (int16_t)((raw_data[2] << 8) | raw_data[3]);
-        sum_gz += (int16_t)((raw_data[4] << 8) | raw_data[5]);
-
-        HAL_Delay(2); // Dãn cách mỗi lần đọc
-    }
-
-    // Chia trung bình để lấy sai số tĩnh
-    gyro_x_offset = (float)sum_gx / samples;
-    gyro_y_offset = (float)sum_gy / samples;
-    gyro_z_offset = (float)sum_gz / samples;
+// Gửi chuỗi qua USART1 (PA15 TX -> HC-05), kiểu chờ: ~87us/byte ở 115200 (dòng 70 ký tự ~6ms).
+// HC-05 chưa kết nối vẫn nhận rồi bỏ -> không treo. Chỉ gọi ở luồng chính, KHÔNG gọi trong ngắt.
+// HC-05 mặc định 9600 baud: phải đổi sang 115200 (lệnh AT+UART=115200,0,0) cho khớp, không thì ra ký tự rác.
+void UART_Print(const char *str)
+{
+    uint16_t len = (uint16_t)strlen(str);
+    // Thời gian chờ theo độ dài + baud (10 bit/byte) + dư 20ms: ở 9600 baud 1 dòng 100 ký tự mất ~104ms,
+    // chờ cố định 100ms thì bị cắt mất cuối dòng
+    uint32_t timeout_ms = (uint32_t)len * 10000U / huart1.Init.BaudRate + 20U;
+    HAL_UART_Transmit(&huart1, (uint8_t *)str, len, timeout_ms);
 }
-void MPU6500_Process_Data(float dt) {
-    // 1. Lắp ghép 14 byte từ mảng DMA thành số nguyên 16-bit
-    int16_t raw_ax = (int16_t)((imu_rx_buffer[0] << 8) | imu_rx_buffer[1]);
-    int16_t raw_ay = (int16_t)((imu_rx_buffer[2] << 8) | imu_rx_buffer[3]);
-    int16_t raw_az = (int16_t)((imu_rx_buffer[4] << 8) | imu_rx_buffer[5]);
-    // byte [6][7] là nhiệt độ, bỏ qua.
-    int16_t raw_gx = (int16_t)((imu_rx_buffer[8] << 8) | imu_rx_buffer[9]);
-    int16_t raw_gy = (int16_t)((imu_rx_buffer[10] << 8) | imu_rx_buffer[11]);
-    int16_t raw_gz = (int16_t)((imu_rx_buffer[12] << 8) | imu_rx_buffer[13]);
-
-    // 2. Trừ đi nhiễu tĩnh và chia hệ số nhạy (16.4 cho thang đo ±2000 dps)
-    float rate_gx = (raw_gx - gyro_x_offset) / 16.4f;
-    float rate_gy = (raw_gy - gyro_y_offset) / 16.4f;
-    float rate_gz = (raw_gz - gyro_z_offset) / 16.4f;
-
-    // 3. Tính góc tuyệt đối từ Gia tốc kế
-    // Lưu ý: Tùy chiều gắn chip trên xe của bạn mà trục X/Y có thể đảo cho nhau
-    float pitch_acc = atan2f(-raw_ax, sqrtf(raw_ay * raw_ay + raw_az * raw_az)) * 180.0f / 3.141592f;
-    float roll_acc  = atan2f(raw_ay, raw_az) * 180.0f / 3.141592f;
-
-    // 4. BỘ LỌC BÙ (COMPLEMENTARY FILTER)
-    // Hệ số alpha (0.96) có nghĩa là: 96% tin tưởng vào độ nhạy của Gyro, 4% dùng Accel để neo giữ không bị trôi
-    float alpha = 0.96f;
-    pitch_angle = alpha * (pitch_angle + rate_gy * dt) + (1.0f - alpha) * pitch_acc;
-    roll_angle  = alpha * (roll_angle  + rate_gx * dt) + (1.0f - alpha) * roll_acc;
-
-    // 5. Tính góc Yaw (Heading) với Deadband
-    // Góc Yaw không có giá trị từ gia tốc kế để bù, nên chỉ dùng tích phân Gyro.
-    // Lọc bỏ các xung nhiễu nhỏ hơn 0.8 độ/giây để xe đứng yên không bị trôi góc
-    if (fabs(rate_gz) > 0.8f) {
-        yaw_angle += rate_gz * dt;
+// Chờ nhận 1 ký tự bất kỳ qua USART1 (gửi từ app Bluetooth). In lời nhắc mỗi 2s để máy vừa kết nối cũng thấy.
+void UART_WaitStart(const char *prompt)
+{
+    uint8_t c;
+    __HAL_UART_CLEAR_OREFLAG(&huart1);    // Đọc SR + DR: bỏ ký tự cũ còn kẹt và cờ tràn
+    while (1) {
+        UART_Print(prompt);
+        if (HAL_UART_Receive(&huart1, &c, 1, 2000) == HAL_OK) return;
     }
 }
-void My_MPU6500_Callback(I2C_HandleTypeDef *hi2c){
-	MPU6500_Process_Data(0.005);
-	 print_mpu6500();
-}
-void print_mpu6500(){
-
-		 	          // 2. In giá trị 3 trục Ox, Oy, Oz của Gia tốc kế (g) và Gyroscope (deg/s)
-		 	  snprintf(msg, sizeof(msg), "DATA,%f,%f,%f\r\n",
-		 			 pitch_angle, // Góc ngóc đầu/chúi mũi
-		 			      roll_angle,  // Góc lật nghiêng xe
-		 			     yaw_angle);
-
-		 	      CDC_Print(msg);
-		 	          // Chu kỳ cập nhật (ví dụ 100ms một lần)
-		 	          HAL_Delay(20);
-
-}
-//Hàm test LED
-void print_LED(){
-	      // Sử dụng hàm CDC_Print của bạn để tránh mất gói tin khi USB Busy
-	      sprintf(msg, "IRFL:%u | IRL:%u | IRR:%u | IRFR:%u\r\n",
-	              adc_value[0], adc_value[1], adc_value[2], adc_value[3]);
-
-	      CDC_Print(msg);
-		  HAL_Delay(20);
-}
-//Test ENCODER and interup Veloc
-void print_Velocity(){
-
-
-		  uint16_t len = sprintf(msg, "Speed L: %ld | R: %ld\r\n", speed_left_int_uMs, speed_right_int_uMs);
-		  CDC_Transmit_FS((uint8_t*)msg, len);
-		  HAL_Delay(50);
-		   len = sprintf(msg, "Speed L: %ld | R: %ld\r\n", TIM3->CNT, TIM2->CNT);
-			  CDC_Transmit_FS((uint8_t*)msg, len);
-	      // Delay một chút để tránh làm treo phần mềm Serial Monitor trên máy tính
-	      HAL_Delay(10);
+// Đọc 1 dòng qua USART1 (kết thúc bằng \r hoặc \n), bỏ qua các dòng trống (cặp \r\n của terminal).
+// Trả về số ký tự, hoặc -1 nếu quá timeout_ms mà chưa có dòng nào. buf luôn kết thúc bằng '\0'.
+int UART_ReadLine(char *buf, int size, uint32_t timeout_ms)
+{
+    int n = 0;
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_GetTick() - t0 < timeout_ms) {
+        uint8_t c;
+        if (HAL_UART_Receive(&huart1, &c, 1, 10) != HAL_OK) {
+            __HAL_UART_CLEAR_OREFLAG(&huart1);  // Tràn (gõ nhanh hơn đọc) thì bỏ, đọc tiếp
+            continue;
+        }
+        if (c == '\r' || c == '\n') {
+            if (n > 0) break;                 // Hết dòng
+            continue;                         // Dòng trống: bỏ qua
+        }
+        if (n < size - 1) buf[n++] = (char)c;
+    }
+    buf[n] = '\0';
+    return (n > 0) ? n : -1;
 }
 /* USER CODE END PFP */
 
@@ -341,60 +187,51 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM9_Init();
   MX_USB_DEVICE_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  // 1. Kích hoạt ADC ở chế độ DMA trước để nó nằm vùng chờ tín hiệu
-  // Kích Hoạt Tim4 nguồn trig cho DMA ADC 5khz
-  // TIM 4 CH4 no output generator PWWM
-  HAL_TIM_Base_Start(&htim4);
-  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
-  // Kích Hoạt TIM9 IT ngắt Tính Vận tốc tức thời 500Hz
+  // 1. Cảm biến hồng ngoại: ADC quét 4 kênh bằng DMA, TIM4 CC4 kích ~5kHz (adc.c)
+  ADC_IR_Start();
+  // 2. Động cơ: PWM TIM1/TIM5 + encoder TIM2/TIM3, động cơ ở trạng thái phanh (pid.c)
+  Motor_Init();
+  // 3. Bật ngắt TIM9 500Hz SAU CÙNG: nhịp 2ms chạy vòng vận tốc + đọc IMU,
+  //    lúc này PWM, encoder đã sẵn sàng (IMU tự chờ imu_ready mới đọc)
   HAL_TIM_Base_Start_IT(&htim9);
-  //
-  // Kích Hoạt DMA cho ADC
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_value, 4);
-  // 2. Kích hoạt Timer 1 (Base đếm) 20kz cho PWM TIM1 CH2N
-  // 3. Kích hoạt kênh PWM 1 CHO bên trái
-  HAL_TIM_Base_Start(&htim1);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
-  // 2. Kích hoạt Timer 5 (Base đếm) 20kz cho PWM TIM5 CH4N
-   // 3. Kích hoạt kênh PWM 5
-  //CHO bên phải
-  HAL_TIM_Base_Start(&htim5);
-  HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3);
-  // Kích Hoạt TIMER cho ENCODER
-  //TIM 2 CHO bên phải
-  //TIM3 CHO bên trái
-  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
-  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
-
-
-
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   // INIT CÁC GPIO
-  // Bật tất cả LED phát (Chỉ để test, nếu làm mạch thật cần băm xung theo Timer)
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3|GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_SET);
-  // Chờ cho led bật hoàn toàn.
+  // Bật LED phát hồng ngoại (adc.c), chờ cho led bật hoàn toàn.
+  ADC_IR_EmittersOn();
   HAL_Delay(300);
   //
-  //Tắt Động Cơ
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, 0);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, 0);
-  TIM1->CCR3=2900;
-  TIM5->CCR3=2999;
-  //
 // KHỞI ĐÔNG MPU LỖI NẾU LED KO SÁNG
-  if (MPU6500_Init() == HAL_OK) {
-	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, 1);
+  // Khởi tạo + hiệu chỉnh gyro (~1.2s, để xe đứng yên), xong mới cho ngắt TIM9 đọc IMU bằng DMA (mpu6500.c)
+  if (MPU6500_Setup() == HAL_OK) {
+	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 1);
     	      } else {
-    	    	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, 0);
+    	    	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, 0);
     	      }
-  MPU6500_Calibrate();
+  // Ví dụ chạy PID vận tốc (mm/s, dương = chạy tới):
+  // Motor_SetSpeed(300.0f, 300.0f);   // tăng tốc dần lên 300 mm/s
+  // Motor_SetSpeed(0.0f, 0.0f);       // giảm tốc dần rồi dừng
+  // Motor_Stop();                     // dừng ngay, tắt PID
+  // gọi print_SpeedPID() trong while(1) để xem đáp ứng
+  // PID_Test(0);                      // chạy bài test PID rồi in báo cáo (bỏ 2 dòng trong while(1))
+  // PID_Test(1);                      // như trên, in thêm dữ liệu thô từng 2ms để vẽ đồ thị
+  // PID_Test chạy xong sẽ đứng phanh CHỜ máy tính mở cổng COM rồi mới in, in xong mới chạy lần tiếp theo.
+  // Gọi trong while(1) -> lặp lại; muốn chạy đúng 1 lần thì gọi ở đây (trước while) và để while(1) trống.
+  // MPU6500_Test(60);                 // đo nhiễu IMU khi tắt PWM / PWM băm xung / bánh quay + 60s theo dõi
+                                       // bias gyro theo nhiệt độ (KÊ BÁNH LÊN), xong chờ mở cổng COM rồi in
+  // Rectangle_Test(300.0f, 200.0f);   // đi hình chữ nhật 30x20cm quay phải, về chỗ cũ (ĐẶT TRÊN SÀN), xong chờ COM rồi in
+  // Straight_Test(500.0f);            // đi thẳng 500mm (số tự nhập, âm = lùi), xong chờ COM rồi in báo cáo
+   //Straight_Log_UART(1000.0f);       // gửi 1 ký tự qua Bluetooth -> đi thẳng 1m, vừa chạy vừa in yaw gyro/encoder qua HC-05
+  // Move_Straight(180.0f); Turn_Right(90.0f); Turn_Left(90.0f);   // các lệnh lẻ (chờ xong mới chạy lệnh sau)
   while (1)
   {
+	 // Straight_Log_UART(1000.0f);
+	  Heading_PID_Test(1200.0f, 0);
+	  HAL_Delay(1000);
 
     /* USER CODE END WHILE */
 
@@ -604,6 +441,10 @@ static void MX_TIM1_Init(void)
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
@@ -654,7 +495,7 @@ static void MX_TIM2_Init(void)
   sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
+  sConfig.IC1Filter = 15;
   sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
@@ -703,7 +544,7 @@ static void MX_TIM3_Init(void)
   sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
+  sConfig.IC1Filter = 15;
   sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
@@ -814,6 +655,10 @@ static void MX_TIM5_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM5_Init 2 */
 
   /* USER CODE END TIM5_Init 2 */
@@ -863,6 +708,39 @@ static void MX_TIM9_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 9600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -900,30 +778,30 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3|GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : PA3 PA8 PA9 PA10 */
-  GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PB0 PB14 PB15 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_14|GPIO_PIN_15;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PB12 */
   GPIO_InitStruct.Pin = GPIO_PIN_12;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB14 PB15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_14|GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PA8 PA9 PA10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -936,34 +814,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
     // Cú pháp đúng: TIM9 (không có &htim)
     if (htim->Instance == TIM9)
     {
-        uint16_t curr_cnt_left = TIM3->CNT;
-        uint16_t curr_cnt_right = TIM2->CNT;
-
-        int16_t delta_pulse_left = (int16_t)(curr_cnt_left - prev_cnt_left);
-        int16_t delta_pulse_right = (int16_t)(curr_cnt_right - prev_cnt_right);
-
-        prev_cnt_left = curr_cnt_left;
-        prev_cnt_right = curr_cnt_right;
-
-        // 2. TÍNH TỐC ĐỘ (m/s)
-        speed_left_ms = ((float)delta_pulse_left / 700) * 141.3716694f;
-        speed_right_ms = ((float)delta_pulse_right / 700) * 141.3716694f;
-
-        speed_left_int_uMs = (int32_t)(speed_left_ms * 1000000.0f);
-        speed_right_int_uMs = (int32_t)(speed_right_ms * 1000000.0f);
-
-        // CHỈ ra lệnh khởi động DMA, không xử lý MPU ở đây
-        HAL_I2C_Mem_Read_DMA(&hi2c1, MPU6050_ADDR, 0x3B, I2C_MEMADD_SIZE_8BIT, imu_rx_buffer, 14);
-    }
-}
-void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
-{
-    if (hi2c->Instance == I2C1)
-    {
-        // 1. Tính toán MPU6500 (Góc Pitch, Roll, Yaw)
-        MPU6500_Process_Data(0.005f);
-
-        // 2. Chạy thuật toán PID ngay tại đây
+        // Nhịp điều khiển 2ms (ngắt TIM1_BRK_TIM9). Chỉ gọi hàm không chặn, không in USB ở đây.
+        // 1. Đọc encoder + PID vận tốc động cơ (pid.c)
+        Motor_Speed_Tick();
+        // 2. Ra lệnh đọc IMU bằng DMA; đọc xong HAL gọi HAL_I2C_MemRxCpltCallback (mpu6500.c)
+        MPU6500_Tick();
     }
 }
 /* USER CODE END 4 */
