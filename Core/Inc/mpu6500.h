@@ -36,24 +36,38 @@
 // Quy ước: yaw_angle TĂNG khi xe quay TRÁI (nhìn từ trên xuống). Dấu phụ thuộc chiều gắn chip (ngửa/úp):
 // xoay tay xe sang trái mà yaw giảm thì đổi dấu. Xe này: gyro Z ngược quy ước -> -1 (đã kiểm tra trên xe)
 #define YAW_SIGN              (-1)
-// Đứng yên = 2 bánh không quay (encoder) VÀ |Gz| nhỏ, liên tục STILL_HOLD_S giây. Khi đứng yên:
-// giữ nguyên yaw và cho offset Gz bám theo bias thật (sai số hiệu chỉnh lúc khởi động, trôi theo nhiệt độ).
+// Đứng yên = 2 bánh không quay (encoder) VÀ Gz ÊM (không dao động) VÀ |Gz| nhỏ, liên tục một khoảng thời gian.
+// Khi đứng yên: giữ nguyên yaw và cho offset Gz bám theo bias thật (sai số hiệu chỉnh, trôi theo nhiệt độ).
 // Khi chạy: cộng TOÀN BỘ gyro vào yaw, không có ngưỡng chết (ngưỡng chết cũ 0.8 độ/s nuốt mất các
 // góc lệch nhỏ khi chạy thẳng và biến nhiễu rung thành trôi góc ~1.4 độ/phút)
+// Vì sao phải xét Gz êm: xoay xe bằng tay lúc động cơ đang phanh -> bánh trượt chứ không lăn, encoder báo
+// đứng yên -> đoạn xoay chậm cuối mỗi lần chỉnh tay bị coi là đứng yên: yaw bị giữ + offset bị kéo lệch
+// (đo trên xe 09/10/2026: xoay tay về hướng cũ mà yaw lệch -5..+2 độ; mô phỏng 6 lần xoay lệch 22 độ).
+// Xe nằm yên trên sàn: Gz gần như không đổi (dao động ~0.05 độ/s). Tay cầm / xoay tay: Gz luôn dao động.
 #define STILL_SPEED_MMS       1.0f        // |vận tốc bánh đã lọc| dưới mức này coi như bánh đứng
-// |Gz| dưới mức này. Phải lớn hơn sai số offset có thể có: hiệu chỉnh lúc khởi động bị xoay nhẹ (đặt xe xuống)
-// từng lệch 2.68 độ/s -> với ngưỡng cũ 1.0 không bao giờ "đứng yên" nên không tự sửa được, xe quay ~12 độ/m.
-// Bánh đứng yên thì xe trên sàn không thể quay, nên ngưỡng rộng vẫn an toàn (MPU6500: offset xuất xưởng +-5 độ/s)
-#define STILL_GZ_DPS          5.0f
+#define STILL_DEV_DPS         0.2f        // Độ dao động Gz (TB |Gz - TB trượt 0.1s|, lọc 0.25s) phải dưới mức này
+#define STILL_GZ_DPS          1.0f        // |Gz| < 1 độ/s: đứng yên sau STILL_HOLD_S
+#define STILL_HOLD_S          0.25f
+// 1..5 độ/s mà vẫn êm: chỉ có thể là offset sai (vd hiệu chỉnh lúc bật nguồn bị xoay nhẹ, từng lệch 2.68 độ/s)
+// -> vẫn tính là đứng yên nhưng phải giữ lâu hơn, để offset tự sửa được (MPU6500: offset xuất xưởng +-5 độ/s)
+#define STILL_GZ_MAX_DPS      5.0f
+#define STILL_HOLD_LONG_S     2.0f
+#define GYRO_BIAS_TAU_S       2.0f        // Tốc độ offset Gz bám theo bias khi đứng yên (hằng số thời gian)
 #define GYRO_REZERO_SAMPLES   250         // MPU6500_ZeroGyroZ: lấy trung bình 250 mẫu (0.5s)
-#define STILL_HOLD_S          0.25f       // Phải thỏa liên tục chừng này giây mới tính là đứng yên
-#define GYRO_BIAS_TAU_S       1.0f        // Tốc độ offset Gz bám theo bias khi đứng yên (hằng số thời gian)
 
 // ===== HIỆU CHỈNH GYRO LÚC KHỞI ĐỘNG =====
 #define GYRO_CAL_SAMPLES      500         // Số mẫu lấy trung bình (~1.2s)
 #define GYRO_CAL_DISCARD      50          // Bỏ các mẫu đầu: gyro vừa khởi động / DLPF vừa đổi cấu hình
 #define GYRO_CAL_MAX_STD_DPS  0.3f        // Nhiễu lớn hơn = xe bị chạm/rung lúc hiệu chỉnh -> đo lại
-#define GYRO_CAL_RETRY        3           // Số lần đo lại tối đa
+// Trung bình Gz nửa đầu và nửa sau lệch nhau hơn mức này = xe đang bị xoay chậm (đặt xe xuống) -> đo lại
+// (nhiễu chỉ làm 2 trung bình lệch ~0.01 độ/s)
+#define GYRO_CAL_MAX_DRIFT_DPS 0.1f
+#define GYRO_CAL_RETRY        5           // Số lần đo lại tối đa (~1.5s mỗi lần: 550 mẫu x (HAL_Delay(2) ~2.5ms + đọc I2C))
+// GIỚI HẠN THỜI GIAN hiệu chỉnh lúc khởi động (người dùng yêu cầu 14/10/2026, trước đây xe bị cầm / rung thì đo lại tới
+// ~9s như bị treo): không đủ thời gian đo thêm 1 lần nữa thì thôi -> HAL_TIMEOUT, xe khởi động ở trạng thái "bị nhấc"
+// (khóa động cơ, LED PB15 tắt) và tự hiệu chỉnh lại khi được đặt nằm yên trên sàn (Lift_Update)
+#define GYRO_CAL_MAX_MS       3000
+#define GYRO_CAL_I2C_TIMEOUT_MS 5         // 1 lần đọc 6 byte ~0.3ms; bus I2C kẹt thì không chờ 100ms mỗi mẫu
 
 // ===== CẤU HÌNH MPU6500_Test =====
 #define MPU_TEST_SAMPLES      1000        // Số mẫu mỗi điều kiện đo nhiễu (1000 x 2ms = 2s)
@@ -62,12 +76,43 @@
 #define MPU_TEMP_LOG_MAX      600         // Theo dõi nhiệt độ tối đa 600s, 1 điểm/giây (~14KB RAM)
 #define YAW_BIAS_WARN_DPS     0.05f       // Bias Gz còn lại lớn hơn mức này (~3 độ/phút) thì báo cao
 
+// ===== NHẤC XE / ĐẶT XE (tự động, chạy trong ngắt IMU) =====
+// NHẤC XE LÊN: tắt động cơ ngay (phanh), hủy chuyển động đang chạy (Move_Straight / Turn_Angle... trả về 0),
+//   chặn Motor_SetSpeed / Motor_SetPWM, TẮT LED PB15.
+// ĐẶT XE XUỐNG, nằm yên LIFT_PLACE_S: chỉnh lại offset gyro 3 trục, yaw = 0 (góc ban đầu = góc lúc đặt xuống),
+//   gốc vị trí + hướng đích = chỗ đặt, BẬT LED PB15 = xe sẵn sàng hoạt động.
+// Nhận biết nhấc chỉ bằng GIA TỐC KẾ (không dùng gyro: quay tại chỗ nhanh không bị nhầm là bị nhấc):
+//   - nghiêng: hướng trọng lực (accel lọc LIFT_TILT_TAU_S) lệch hướng lúc nằm trên sàn > LIFT_TILT_DEG
+//     (xe chạy trên sàn: tăng/giảm tốc, va tường chỉ làm lệch < ~10 độ)
+//   - hoặc nâng thẳng lên: vận tốc theo phương thẳng đứng (tích phân gia tốc, rò LIFT_VZ_TAU_S) > LIFT_VZ_MS
+//   liên tục LIFT_CONFIRM_S
+// Nhận biết đặt xuống: liên tục LIFT_PLACE_S có |gyro| mọi trục < LIFT_PLACE_GYRO_DPS, Gz êm (như nhận biết
+//   đứng yên: gz_dev < STILL_DEV_DPS), độ rung gia tốc < LIFT_PLACE_ACC_DEV_G, 2 bánh đứng yên,
+//   nghiêng < LIFT_PLACE_TILT_DEG. Tay cầm xe luôn run (gia tốc > ~5mg, gyro > ~0.5 độ/s) -> cầm yên trên tay
+//   không bị nhận nhầm là đã đặt; đếm chỉ bắt đầu khi tay đã buông (mô phỏng: LED sáng ~1.4s sau khi buông)
+// Theo dõi để chỉnh ngưỡng: cột nghieng, vz, rung, nhac của print_mpu6500()
+#define LIFT_TILT_DEG         20.0f       // Nghiêng quá mức này = bị nhấc (độ)
+#define LIFT_TILT_TAU_S       0.2f        // Lọc accel khi tính nghiêng (s): bỏ qua cú tăng tốc / va chạm ngắn
+#define LIFT_VZ_MS            0.12f       // Vận tốc thẳng đứng quá mức này = bị nhấc (m/s)
+#define LIFT_VZ_TAU_S         0.3f        // Hằng số rò của tích phân vận tốc đứng (s): sai số offset không cộng dồn
+#define LIFT_CONFIRM_S        0.02f       // Điều kiện nhấc phải đúng liên tục chừng này
+#define LIFT_PLACE_S          1.0f        // Nằm yên chừng này mới coi là đã đặt xuống (s)
+#define LIFT_PLACE_GYRO_DPS   2.0f
+#define LIFT_PLACE_TILT_DEG   10.0f
+#define LIFT_PLACE_ACC_DEV_G  0.004f      // Độ rung |a| (TB |(|a| - TB trượt 0.1s)|): sàn ~1.5mg, tay cầm > 5mg
+#define LED_RUN_PORT          GPIOB       // LED báo xe đang trên sàn, sẵn sàng hoạt động
+#define LED_RUN_PIN           GPIO_PIN_15
+#define LED_RUN_ON            GPIO_PIN_SET    // Mức logic làm LED sáng (LED nối ngược thì đổi 2 dòng này)
+#define LED_RUN_OFF           GPIO_PIN_RESET
+
 // ===== KẾT QUẢ =====
 extern float pitch_angle;                 // Góc ngóc đầu/chúi mũi (độ)
 extern float roll_angle;                  // Góc lật nghiêng xe (độ)
-extern float yaw_angle;                   // Góc hướng xe (độ), chỉ tích phân gyro
+extern float yaw_angle;                   // Góc đã quay cộng dồn (độ), KHÔNG quấn (vd 450 = 1 vòng + 90) - điều khiển dùng
+float MPU6500_Wrap360(float deg);         // Quấn góc về [0, 360) - để hiển thị / đổi ra hướng
+float MPU6500_YawWrapped(void);           // Hướng xe 0..360 (= MPU6500_Wrap360(yaw_angle))
 extern volatile float yaw_rate_dps;       // Tốc độ quay quanh Z (độ/s) đã trừ offset, cùng chiều yaw (dương = trái)
-extern volatile int16_t imu_raw[7];       // Mẫu thô mới nhất: ax, ay, az, nhiệt, gx, gy, gz (ghi dữ liệu rung)
+extern volatile int16_t imu_raw[7];       // Mẫu thô mới nhất: ax, ay, az, nhiệt, gx, gy, gz
 extern volatile uint32_t imu_sample_count; // Tăng 1 mỗi mẫu IMU xử lý xong
 extern float gyro_x_offset, gyro_y_offset, gyro_z_offset;
 extern int16_t Accel_X_RAW, Accel_Y_RAW, Accel_Z_RAW;   // Từ MPU6500_Read_All()
@@ -75,26 +120,30 @@ extern int16_t Gyro_X_RAW,  Gyro_Y_RAW,  Gyro_Z_RAW;
 extern volatile uint8_t imu_ready;        // 1: ngắt TIM9 đang đọc IMU bằng DMA
 extern volatile uint8_t imu_still;        // 1: xe đang đứng yên (yaw giữ nguyên, offset Gz đang tự chỉnh)
 extern uint8_t mpu_whoami;                // Đọc lúc khởi tạo: 0x70 MPU6500, 0x71 lõi MPU9250
+extern volatile uint8_t robot_lifted;     // 1: xe đang bị nhấc lên (động cơ bị khóa), 0: xe trên sàn
+extern float lift_tilt_deg;               // Độ nghiêng so với lúc nằm trên sàn (độ) - để theo dõi / chỉnh ngưỡng
+extern float lift_vz_ms;                  // Vận tốc thẳng đứng ước lượng (m/s, dương = đi lên)
+extern float lift_acc_dev;                // Độ rung gia tốc (g) - nằm yên trên sàn ~0.0015
 
 // ===== KHỞI ĐỘNG (luồng chính) =====
 HAL_StatusTypeDef MPU6500_Init(void);
-HAL_StatusTypeDef MPU6500_Calibrate(void); // HAL_BUSY: xe không đứng yên sau GYRO_CAL_RETRY lần đo
+HAL_StatusTypeDef MPU6500_Calibrate(void); // HAL_BUSY: xe không đứng yên sau GYRO_CAL_RETRY lần đo, HAL_TIMEOUT: hết GYRO_CAL_MAX_MS
 // Init + Calibrate + cho phép ngắt TIM9 đọc DMA. Khác HAL_OK: MPU lỗi (không đọc) hoặc hiệu chỉnh
 // bị rung (vẫn chạy, offset Gz tự sửa dần khi xe đứng yên)
 HAL_StatusTypeDef MPU6500_Setup(void);
 // Chỉnh lại offset gyro Z khi xe đứng yên trên sàn (luồng chính, sau khi imu_ready = 1, dùng mẫu DMA):
 // trung bình GYRO_REZERO_SAMPLES mẫu. Bánh quay / bị chạm (nhiễu lớn) thì giữ offset cũ, trả HAL_BUSY
 HAL_StatusTypeDef MPU6500_ZeroGyroZ(void);
-extern float gyro_z_rezero_dps;           // Lần chỉnh gần nhất đã sửa offset Z bao nhiêu (độ/s)
 void MPU6500_Read_All(void);              // Đọc kiểu chờ, KHÔNG gọi sau khi imu_ready = 1
 void I2C_ScanAndPrint_CDC(void);
 
 // ===== GỌI TRONG NGẮT =====
 void MPU6500_Tick(void);                  // Ngắt TIM9 mỗi 2ms: ra lệnh đọc 14 byte bằng DMA
 void MPU6500_Process_Data(float dt);      // Callback I2C DMA xong: tính góc
-uint32_t MPU6500_ErrorCount(void);        // Tổng lỗi bus I2C + lệnh đọc DMA bị từ chối từ lúc khởi động
 
 // ===== DEBUG / TEST (luồng chính) =====
+// In 1 dòng giá trị MPU SAU BỘ LỌC qua USART1 (HC-05): pitch, roll, yaw, gyro x/y/z (độ/s), accel x/y/z (g),
+// nhiệt độ, cờ đứng yên. Gọi lặp trong while(1), tự giãn nhịp bằng HAL_Delay. Tiêu đề in mỗi 50 dòng
 void print_mpu6500(void);
 // Đo nhiễu IMU khi tắt PWM / PWM băm xung / bánh quay, rồi theo dõi bias gyro theo nhiệt độ
 // trong temp_seconds giây (0 = bỏ qua). KÊ BÁNH LÊN. Xong chờ máy tính mở cổng COM rồi in báo cáo.

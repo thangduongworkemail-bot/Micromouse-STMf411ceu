@@ -58,3 +58,13 @@ Debug/
 Release/
 .settings/
 *.launch
+
+# Phan mem mo phong mms (ma nguon ben thu ba + file build + thu vien Qt) - khong dua vao repo firmware
+# Simulator/mms-c (thuat toan cua minh) VAN duoc commit
+Simulator/mms/
+Simulator/mazefiles/
+
+# File do maze_viewer.py tao ra khi chay (log ban do, hinh .ps) - khong phai ma nguon
+maze/logs/
+maze/*.ps
+__pycache__/

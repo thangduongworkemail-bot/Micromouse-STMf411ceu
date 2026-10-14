@@ -39,10 +39,27 @@ volatile uint8_t imu_ready = 0;
 static volatile uint16_t imu_ticks = 0;
 volatile uint8_t imu_still = 0;           // 1: xe đứng yên -> giữ yaw, offset Gz tự chỉnh
 static float still_time = 0.0f;           // Thời gian (s) điều kiện đứng yên đã thỏa liên tục
+static float gz_avg = 0.0f, gz_dev = 0.0f;  // Trung bình trượt Gz và độ dao động của Gz (độ/s), xem Process_Data
 static float gyro_z_cal = 0.0f;           // Offset Gz lúc hiệu chỉnh khởi động (gyro_z_offset thì tự chỉnh dần)
 uint8_t mpu_whoami = 0;                   // Thanh ghi WHO_AM_I: 0x70 MPU6500, 0x71 lõi MPU9250
 static volatile uint32_t imu_i2c_errors = 0;   // Lỗi bus I2C khi đọc DMA (HAL_I2C_ErrorCallback)
 static volatile uint32_t imu_read_fail  = 0;   // Lệnh đọc DMA bị HAL từ chối (bus đang bận/kẹt)
+
+// ===== NHẤC XE / ĐẶT XE (xem mpu6500.h) =====
+volatile uint8_t robot_lifted = 0;
+float lift_tilt_deg = 0.0f;
+float lift_vz_ms    = 0.0f;
+float lift_acc_dev  = 0.01f;
+static float   lift_acc_avg = 1.0f;      // |a| trung bình trượt ~0.1s (g), cho độ rung lift_acc_dev
+static float   lift_ref[3] = { 0.0f, 0.0f, 1.0f };  // Hướng "lên" (vector đơn vị, hệ trục chip) lúc nằm trên sàn
+static float   lift_ref_g  = 1.0f;       // |gia tốc| lúc nằm yên (g; chip này đọc ~1.19 vì offset accel)
+static uint8_t lift_ref_ok = 0;          // 0: chưa có hướng gốc (lấy ở mẫu đầu tiên sau MPU6500_Setup)
+static float   lift_af[3];               // Gia tốc lọc thông thấp (g) để tính nghiêng
+static float   lift_cond_t = 0.0f;       // Thời gian điều kiện "bị nhấc" đã đúng liên tục (s)
+// Cửa sổ nằm yên lúc chờ đặt xuống: cộng dồn gyro thô (offset mới) + gia tốc (hướng gốc mới)
+static float    place_t, place_g[3], place_gz2, place_gz_half, place_a[3];
+static uint32_t place_n, place_n_half;
+static void Lift_Update(const volatile int16_t *raw, float rate_gx, float rate_gy, float rate_gz, float dt);
 
 // ===== THỐNG KÊ CHO MPU6500_Test =====
 // Callback I2C cộng dồn từng mẫu (trong ngắt), luồng chính tính trung bình / độ nhiễu khi đo xong.
@@ -156,29 +173,43 @@ HAL_StatusTypeDef MPU6500_Init(void) {
     return HAL_OK;
 }
 // Hiệu chỉnh offset gyro lúc khởi động, xe phải đứng yên. Bỏ GYRO_CAL_DISCARD mẫu đầu (gyro vừa
-// khởi động / bộ lọc vừa đổi cấu hình), lấy trung bình GYRO_CAL_SAMPLES mẫu. Nhiễu lớn (xe bị chạm,
-// rung) thì đo lại. Về sau offset Z còn tự chỉnh mỗi khi xe đứng yên (MPU6500_Process_Data).
+// khởi động / bộ lọc vừa đổi cấu hình), lấy trung bình GYRO_CAL_SAMPLES mẫu. Đo lại khi: nhiễu lớn (xe bị
+// chạm, rung) hoặc Gz trung bình nửa đầu khác nửa sau (xe đang bị xoay chậm lúc đặt xuống).
+// Về sau offset Z còn tự chỉnh mỗi khi xe đứng yên (MPU6500_Process_Data) và trước mỗi lần chạy.
 HAL_StatusTypeDef MPU6500_Calibrate(void) {
     uint8_t raw_data[6];
+    uint32_t t0 = HAL_GetTick(), t_try = 0;   // t_try: thời gian 1 lần đo (lấy từ lần trước)
 
     HAL_Delay(50);                        // Gyro khởi động từ sleep mất ~35ms (datasheet)
     for (int attempt = 0; attempt < GYRO_CAL_RETRY; attempt++) {
+        uint32_t ta = HAL_GetTick();
+        if (ta - t0 + t_try > GYRO_CAL_MAX_MS) return HAL_TIMEOUT;   // Không kịp đo thêm 1 lần: giữ kết quả lần trước
         int64_t sum[3] = { 0, 0, 0 }, sumsq[3] = { 0, 0, 0 };
-        int n = 0;
+        int64_t sum_z_half = 0;           // Tổng Gz nửa đầu
+        int n = 0, n_half = 0;
 
         for (int i = 0; i < GYRO_CAL_DISCARD + GYRO_CAL_SAMPLES; i++) {
+            if (HAL_GetTick() - t0 > GYRO_CAL_MAX_MS) return HAL_TIMEOUT;   // Bus I2C lỗi kéo dài lần đo
             HAL_Delay(2);                 // 1 mẫu mới mỗi 2ms (500Hz)
             // Đọc trực tiếp 6 byte thanh ghi Gyro (0x43 đến 0x48), lần đọc lỗi thì bỏ mẫu đó
-            if (HAL_I2C_Mem_Read(&hi2c1, MPU6500_ADDR, 0x43, I2C_MEMADD_SIZE_8BIT, raw_data, 6, 100) != HAL_OK) continue;
+            if (HAL_I2C_Mem_Read(&hi2c1, MPU6500_ADDR, 0x43, I2C_MEMADD_SIZE_8BIT, raw_data, 6,
+                                 GYRO_CAL_I2C_TIMEOUT_MS) != HAL_OK) continue;
             if (i < GYRO_CAL_DISCARD) continue;
             for (int a = 0; a < 3; a++) {
                 int16_t v = (int16_t)((raw_data[2 * a] << 8) | raw_data[2 * a + 1]);
                 sum[a]   += v;
                 sumsq[a] += (int32_t)v * v;
             }
+            if (i < GYRO_CAL_DISCARD + GYRO_CAL_SAMPLES / 2) {
+                sum_z_half = sum[2];
+                n_half = n + 1;
+            }
             n++;
         }
-        if (n < GYRO_CAL_SAMPLES / 2) continue;   // Bus I2C lỗi quá nhiều: đo lại
+        t_try = HAL_GetTick() - ta;
+        if (n < GYRO_CAL_SAMPLES / 2 || n_half == 0 || n_half >= n) continue;   // Bus I2C lỗi quá nhiều: đo lại
+        // Gz trung bình nửa đầu so với nửa sau (độ/s)
+        float drift = ((float)sum_z_half / n_half - (float)(sum[2] - sum_z_half) / (n - n_half)) / 16.4f;
 
         // Trung bình = sai số tĩnh. Độ lệch chuẩn lớn nhất của 3 trục kiểm tra xe có đứng yên không
         float mean[3], worst_std = 0.0f;
@@ -193,7 +224,7 @@ HAL_StatusTypeDef MPU6500_Calibrate(void) {
         gyro_y_offset = mean[1];
         gyro_z_offset = mean[2];
         gyro_z_cal    = mean[2];
-        if (worst_std < GYRO_CAL_MAX_STD_DPS) return HAL_OK;
+        if (worst_std < GYRO_CAL_MAX_STD_DPS && fabsf(drift) < GYRO_CAL_MAX_DRIFT_DPS) return HAL_OK;
     }
     return HAL_BUSY;                      // Giữ kết quả lần đo cuối, offset Z sẽ tự sửa khi xe đứng yên
 }
@@ -207,8 +238,19 @@ HAL_StatusTypeDef MPU6500_Setup(void)
     status = MPU6500_Calibrate();
     yaw_angle  = 0.0f;
     still_time = 0.0f;
+    gz_avg     = 0.0f;
+    gz_dev     = 1.0f;                    // Bắt đầu "chưa êm": phải êm thật mới tính là đứng yên
     imu_still  = 0;
     imu_ticks  = 0;
+    // Hiệu chỉnh được (xe nằm yên) = xe đang trên sàn: hướng gốc lấy ở mẫu đầu tiên, bật LED.
+    // Không yên (đang cầm trên tay) = coi như đang bị nhấc: khóa động cơ tới khi đặt xuống nằm yên
+    lift_ref_ok  = 0;
+    lift_cond_t  = 0.0f;
+    lift_vz_ms   = 0.0f;
+    place_t      = 0.0f;
+    place_n      = 0;
+    robot_lifted = (status != HAL_OK);
+    HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, robot_lifted ? LED_RUN_OFF : LED_RUN_ON);
     imu_ready  = 1;
     return status;
 }
@@ -287,16 +329,22 @@ void MPU6500_Process_Data(float dt) {
     pitch_angle = alpha * (pitch_angle + rate_gy * dt) + (1.0f - alpha) * pitch_acc;
     roll_angle  = alpha * (roll_angle  + rate_gx * dt) + (1.0f - alpha) * roll_acc;
 
-    // 5. Nhận biết đứng yên: 2 bánh không quay (encoder, pid.c) và |Gz| nhỏ, liên tục STILL_HOLD_S giây
-    //    (xe bị nhấc lên xoay tay: bánh không quay nhưng Gz lớn -> không tính là đứng yên)
+    // 5. Nhận biết đứng yên (xem mpu6500.h): 2 bánh không quay (encoder, pid.c) + Gz êm + |Gz| nhỏ, liên tục
+    //    gz_avg: trung bình trượt Gz (~0.1s), gz_dev: độ dao động TB |Gz - gz_avg| (~0.25s).
+    //    Tay xoay / cầm xe: Gz dao động -> không bao giờ tính là đứng yên, kể cả lúc xoay rất chậm
+    float k_avg = dt / 0.1f, k_dev = dt / 0.25f;
+    if (k_avg > 1.0f) k_avg = 1.0f;
+    if (k_dev > 1.0f) k_dev = 1.0f;
+    gz_avg += k_avg * (rate_gz - gz_avg);
+    gz_dev += k_dev * (fabsf(rate_gz - gz_avg) - gz_dev);
     if (fabsf(speed_left_mms) < STILL_SPEED_MMS && fabsf(speed_right_mms) < STILL_SPEED_MMS
-        && fabsf(rate_gz) < STILL_GZ_DPS) {
-        if (still_time < STILL_HOLD_S) still_time += dt;
-        else imu_still = 1;
+        && gz_dev < STILL_DEV_DPS && fabsf(rate_gz) < STILL_GZ_MAX_DPS) {
+        if (still_time < STILL_HOLD_LONG_S) still_time += dt;
     } else {
         still_time = 0.0f;
-        imu_still  = 0;
     }
+    // |Gz| < 1 độ/s: đứng yên sau 0.25s. 1..5 độ/s (chỉ có thể là offset sai): phải êm liên tục 2s
+    imu_still = (still_time >= ((fabsf(rate_gz) < STILL_GZ_DPS) ? STILL_HOLD_S : STILL_HOLD_LONG_S));
 
     // 6. Góc Yaw (Heading): không có accel để bù, chỉ tích phân gyro
     yaw_rate_dps = YAW_SIGN * rate_gz;    // Cho khâu D giữ hướng (pid.c) và so sánh với encoder
@@ -311,6 +359,120 @@ void MPU6500_Process_Data(float dt) {
         // YAW_SIGN: yaw tăng khi xe quay trái
         yaw_angle += YAW_SIGN * rate_gz * dt;
     }
+
+    // 7. Nhấc xe / đặt xe xuống
+    Lift_Update(imu_raw, rate_gx, rate_gy, rate_gz, dt);
+}
+
+// ===== NHẤC XE / ĐẶT XE (gọi trong ngắt, mỗi mẫu IMU) =====
+static void Lift_ResetWindow(void)
+{
+    place_t = 0.0f;
+    place_n = 0;
+    place_n_half = 0;
+    place_g[0] = place_g[1] = place_g[2] = 0.0f;
+    place_a[0] = place_a[1] = place_a[2] = 0.0f;
+    place_gz2 = place_gz_half = 0.0f;
+}
+static void Lift_Update(const volatile int16_t *raw, float rate_gx, float rate_gy, float rate_gz, float dt)
+{
+    float a[3] = { raw[0] / 16384.0f, raw[1] / 16384.0f, raw[2] / 16384.0f };   // g
+    float an = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+    if (an < 0.2f) return;                // Rơi tự do / đọc lỗi: không có hướng trọng lực để so
+
+    if (!lift_ref_ok) {                   // Mẫu đầu sau MPU6500_Setup
+        for (int i = 0; i < 3; i++) lift_af[i] = a[i];
+        lift_acc_avg = an;
+        if (!robot_lifted) {              // Đang nằm yên trên sàn (hiệu chỉnh được): lấy làm hướng gốc
+            for (int i = 0; i < 3; i++) lift_ref[i] = a[i] / an;
+            lift_ref_g  = an;
+            lift_ref_ok = 1;
+        }
+    }
+
+    // Nghiêng: góc giữa gia tốc đã lọc và hướng "lên" lúc nằm trên sàn
+    float k = dt / (LIFT_TILT_TAU_S + dt);
+    for (int i = 0; i < 3; i++) lift_af[i] += k * (a[i] - lift_af[i]);
+    float afn = sqrtf(lift_af[0] * lift_af[0] + lift_af[1] * lift_af[1] + lift_af[2] * lift_af[2]);
+    float c = (lift_af[0] * lift_ref[0] + lift_af[1] * lift_ref[1] + lift_af[2] * lift_ref[2]) / afn;
+    if (c > 1.0f) c = 1.0f;
+    if (c < -1.0f) c = -1.0f;
+    lift_tilt_deg = acosf(c) * 180.0f / 3.141592f;
+    // Độ rung gia tốc: TB |(|a| - TB trượt 0.1s)| lọc 0.1s (tay cầm luôn run, nằm trên sàn thì gần bằng nhiễu chip)
+    float ka = dt / 0.1f;
+    if (ka > 1.0f) ka = 1.0f;
+    lift_acc_avg += ka * (an - lift_acc_avg);
+    lift_acc_dev += ka * (fabsf(an - lift_acc_avg) - lift_acc_dev);
+    // Vận tốc đứng: gia tốc theo hướng "lên" trừ trọng lực lúc nằm yên, tích phân có rò
+    float a_up = a[0] * lift_ref[0] + a[1] * lift_ref[1] + a[2] * lift_ref[2] - lift_ref_g;
+    lift_vz_ms += a_up * 9.81f * dt - lift_vz_ms * dt / LIFT_VZ_TAU_S;
+
+    if (!robot_lifted) {
+        // 1. Đang trên sàn: nghiêng nhiều hoặc bị nâng lên liên tục LIFT_CONFIRM_S -> bị nhấc
+        if (lift_ref_ok && (lift_tilt_deg > LIFT_TILT_DEG || fabsf(lift_vz_ms) > LIFT_VZ_MS)) lift_cond_t += dt;
+        else lift_cond_t = 0.0f;
+        if (lift_cond_t >= LIFT_CONFIRM_S) {
+            robot_lifted = 1;
+            lift_cond_t  = 0.0f;
+            Lift_ResetWindow();
+            HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, LED_RUN_OFF);
+            Motion_OnLifted();            // pid.c: hủy chuyển động, tắt PID, phanh 2 bánh
+        }
+        return;
+    }
+
+    // 2. Đang bị nhấc: chờ đặt xuống. Mẫu nào không yên (còn tay cầm, đang hạ xuống...) thì đếm lại từ đầu
+    uint8_t calm = fabsf(rate_gx) < LIFT_PLACE_GYRO_DPS && fabsf(rate_gy) < LIFT_PLACE_GYRO_DPS
+                && fabsf(rate_gz) < LIFT_PLACE_GYRO_DPS && gz_dev < STILL_DEV_DPS
+                && lift_acc_dev < LIFT_PLACE_ACC_DEV_G
+                && fabsf(speed_left_mms) < STILL_SPEED_MMS && fabsf(speed_right_mms) < STILL_SPEED_MMS
+                && (!lift_ref_ok || lift_tilt_deg < LIFT_PLACE_TILT_DEG);
+    if (!calm) {
+        Lift_ResetWindow();
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        place_g[i] += raw[4 + i];
+        place_a[i] += a[i];
+    }
+    place_gz2 += (float)raw[6] * raw[6];
+    place_n++;
+    place_t += dt;
+    if (place_n_half == 0 && place_t >= 0.5f * LIFT_PLACE_S) {
+        place_gz_half = place_g[2];
+        place_n_half  = place_n;
+    }
+    if (place_t < LIFT_PLACE_S || place_n_half == 0 || place_n_half >= place_n) return;
+
+    // 3. Đủ thời gian nằm yên: kiểm tra như hiệu chỉnh gyro (Gz nhiễu nhỏ, nửa đầu = nửa sau: không bị xoay chậm)
+    float n       = (float)place_n;
+    float gz_mean = place_g[2] / n;
+    float gz_var  = place_gz2 / n - gz_mean * gz_mean;
+    float drift   = (place_gz_half / place_n_half - (place_g[2] - place_gz_half) / (place_n - place_n_half)) / 16.4f;
+    if ((gz_var > 0.0f && sqrtf(gz_var) / 16.4f > GYRO_CAL_MAX_STD_DPS)
+        || fabsf(drift) > GYRO_CAL_MAX_DRIFT_DPS) {
+        Lift_ResetWindow();
+        return;
+    }
+
+    // 4. ĐÃ ĐẶT XUỐNG: offset gyro mới, hướng "lên" mới, yaw = 0 -> góc ban đầu = góc lúc đặt xuống
+    gyro_x_offset = place_g[0] / n;
+    gyro_y_offset = place_g[1] / n;
+    gyro_z_offset = gz_mean;
+    float m[3] = { place_a[0] / n, place_a[1] / n, place_a[2] / n };
+    float mn = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+    for (int i = 0; i < 3; i++) {
+        lift_ref[i] = m[i] / mn;
+        lift_af[i]  = m[i];
+    }
+    lift_ref_g  = mn;
+    lift_ref_ok = 1;
+    lift_vz_ms  = 0.0f;
+    yaw_angle   = 0.0f;
+    robot_lifted = 0;
+    Lift_ResetWindow();
+    HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, LED_RUN_ON);
+    Motion_OnPlaced();                    // pid.c: hướng đích + gốc vị trí = chỗ đặt
 }
 // DMA I2C1 đọc xong 14 byte (gọi từ ngắt DMA1_Stream0 / I2C1_EV qua HAL)
 void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
@@ -331,14 +493,9 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 }
 // Lỗi bus I2C (NACK, nhiễu làm hỏng xung SCL/SDA...): HAL đã hủy lần đọc DMA và trả I2C về READY,
 // chu kỳ TIM9 sau đọc lại. Chỉ đếm để MPU6500_Test báo cáo.
-uint32_t MPU6500_ErrorCount(void)
-{
-    return imu_i2c_errors + imu_read_fail;
-}
-float gyro_z_rezero_dps = 0.0f;
 HAL_StatusTypeDef MPU6500_ZeroGyroZ(void)
 {
-    float sum = 0.0f, sumsq = 0.0f;
+    float sum = 0.0f, sumsq = 0.0f, sum_half = 0.0f;
     uint32_t n = 0, last = imu_sample_count, t0 = HAL_GetTick();
     if (!imu_ready) return HAL_ERROR;
     while (n < GYRO_REZERO_SAMPLES && HAL_GetTick() - t0 < GYRO_REZERO_SAMPLES * 2U + 500U) {
@@ -349,11 +506,14 @@ HAL_StatusTypeDef MPU6500_ZeroGyroZ(void)
         sum   += v;
         sumsq += v * v;
         n++;
+        if (n == GYRO_REZERO_SAMPLES / 2) sum_half = sum;
     }
-    if (n < GYRO_REZERO_SAMPLES / 2) return HAL_TIMEOUT;
+    if (n < GYRO_REZERO_SAMPLES) return HAL_TIMEOUT;
     float mean = sum / n, var = sumsq / n - mean * mean;
     if (var > 0.0f && sqrtf(var) / 16.4f > GYRO_CAL_MAX_STD_DPS) return HAL_BUSY;   // Bị chạm / rung
-    gyro_z_rezero_dps = (mean - gyro_z_offset) / 16.4f;
+    // Nửa đầu khác nửa sau = đang bị xoay chậm (tay chỉnh xe) -> không đổi offset
+    float drift = (sum_half - (sum - sum_half)) / (GYRO_REZERO_SAMPLES / 2) / 16.4f;
+    if (fabsf(drift) > GYRO_CAL_MAX_DRIFT_DPS) return HAL_BUSY;
     gyro_z_offset = mean;
     return HAL_OK;
 }
@@ -362,19 +522,70 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
     if (hi2c->Instance == I2C1) imu_i2c_errors++;
 }
 
+// Quấn góc về [0, 360) - CHỈ để hiển thị / đổi ra hướng Bắc-Đông-Nam-Tây.
+// yaw_angle (và Robot_Heading trong pid.c) cố ý KHÔNG quấn: điều khiển cần góc liên tục (Turn_Angle(3600) đếm 10
+// vòng, Rectangle_Test cộng dồn hướng đích -90 -180..., Gyro_Spin_Calibrate đo góc giữa các vòng). Quấn yaw_angle
+// thì lúc đi qua mốc 360/0 sai lệch hướng nhảy ~360 độ -> xe quay loạn
+float MPU6500_Wrap360(float deg)
+{
+    float w = fmodf(deg, 360.0f);
+    if (w < 0.0f) w += 360.0f;
+    if (w >= 360.0f) w = 0.0f;            // -0.00001 + 360 làm tròn float ra đúng 360
+    return w;
+}
+float MPU6500_YawWrapped(void)
+{
+    return MPU6500_Wrap360(yaw_angle);
+}
+
 // ===== DEBUG =====
-void print_mpu6500(){
+// IN GIÁ TRỊ MPU SAU BỘ LỌC qua USART1 (HC-05): mỗi lần gọi 1 dòng CSV (gọi lặp trong while(1), giãn nhịp
+// bằng HAL_Delay bên ngoài). Dòng tiêu đề in lần đầu và mỗi 50 dòng (mở terminal giữa chừng vẫn thấy).
+//   pitch, roll : bộ lọc bù gyro + accel, hằng số thời gian ANGLE_COMP_TAU_S (độ)
+//   yaw         : hướng xe quấn về 0..360 (độ, tăng khi quay trái: 90 = đã quay trái 90, 270 = đã quay phải 90).
+//                 Chỉ quấn khi IN RA; yaw_angle dùng tính toán vẫn cộng dồn (vd 450 = 1 vòng + 90)
+//   gx, gy      : gyro đã trừ offset, qua DLPF gyro 41Hz (độ/s)
+//   gz          : tốc độ quay yaw - đúng giá trị yaw và PID giữ hướng dùng (độ/s, dương = trái)
+//   ax, ay, az  : gia tốc qua DLPF accel 20Hz (g, nằm yên trên sàn thì |a| ~ 1)
+//   nhiet       : nhiệt độ chip (°C) | dy: 1 = đang nhận là đứng yên (yaw giữ, offset Z tự chỉnh)
+//   nghieng, vz : độ nghiêng so với lúc nằm trên sàn (độ) và vận tốc thẳng đứng (m/s) - so với ngưỡng
+//                 LIFT_TILT_DEG / LIFT_VZ_MS | rung: độ rung gia tốc (mg), so với LIFT_PLACE_ACC_DEV_G
+//   nhac        : 1 = đang bị nhấc (động cơ khóa)
+// 9600 baud: 1 dòng ~110 ký tự mất ~115ms -> tối đa ~8 dòng/s
+void print_mpu6500(void)
+{
+    static uint16_t lines = 0;
+    int16_t raw[7];
+    float pitch, roll, yaw, gz, offx, offy, tilt, vz, dev;
+    uint8_t still, lifted;
 
-		 	          // 2. In giá trị 3 trục Ox, Oy, Oz của Gia tốc kế (g) và Gyroscope (deg/s)
-		 	  snprintf(msg, sizeof(msg), "DATA,%f,%f,%f\r\n",
-		 			 pitch_angle, // Góc ngóc đầu/chúi mũi
-		 			      roll_angle,  // Góc lật nghiêng xe
-		 			     yaw_angle);
+    if (!imu_ready) {
+        UART_Print("MPU chua san sang (MPU6500_Setup loi hoac chua goi)\r\n");
+        return;
+    }
+    // Chụp 1 bộ số cùng 1 mẫu (ngắt DMA I2C có thể cập nhật giữa chừng), chặn ngắt vài micro giây
+    __disable_irq();
+    for (int i = 0; i < 7; i++) raw[i] = imu_raw[i];
+    pitch = pitch_angle;
+    roll  = roll_angle;
+    yaw   = yaw_angle;
+    gz    = yaw_rate_dps;
+    offx  = gyro_x_offset;
+    offy  = gyro_y_offset;
+    still = imu_still;
+    tilt  = lift_tilt_deg;
+    vz    = lift_vz_ms;
+    dev   = lift_acc_dev;
+    lifted = robot_lifted;
+    __enable_irq();
 
-		 	      CDC_Print(msg);
-		 	          // Chu kỳ cập nhật (ví dụ 100ms một lần)
-		 	          HAL_Delay(20);
-
+    if (lines++ % 50 == 0) UART_Print("MPU,t_ms,pitch,roll,yaw,gx,gy,gz,ax,ay,az,nhiet,dy,nghieng,vz,rung,nhac\r\n");
+    snprintf(msg, sizeof(msg), "MPU,%lu,%+.2f,%+.2f,%.2f,%+.2f,%+.2f,%+.2f,%+.3f,%+.3f,%+.3f,%.1f,%u,%.1f,%+.3f,%.1f,%u\r\n",
+             (unsigned long)HAL_GetTick(), pitch, roll, MPU6500_Wrap360(yaw),   // yaw in ra: 0..360
+             (raw[4] - offx) / 16.4f, (raw[5] - offy) / 16.4f, gz,
+             raw[0] / 16384.0f, raw[1] / 16384.0f, raw[2] / 16384.0f,
+             raw[3] / 333.87f + 21.0f, still, tilt, vz, dev * 1000.0f, lifted);
+    UART_Print(msg);
 }
 
 // ===== TEST NHIỄU / NHIỆT ĐỘ (MPU6500_Test) =====

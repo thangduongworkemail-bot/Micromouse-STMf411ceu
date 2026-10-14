@@ -16,6 +16,7 @@
 #include "mpu6500.h"        // IMU
 #include "adc.h"            // cảm biến hồng ngoại
 #include "pid.h"            // động cơ + encoder + PID vận tốc
+#include "solving_maze.h"   // giải mê cung flood fill, chạy liên tục
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -120,27 +121,6 @@ void UART_WaitStart(const char *prompt)
         if (HAL_UART_Receive(&huart1, &c, 1, 2000) == HAL_OK) return;
     }
 }
-// Đọc 1 dòng qua USART1 (kết thúc bằng \r hoặc \n), bỏ qua các dòng trống (cặp \r\n của terminal).
-// Trả về số ký tự, hoặc -1 nếu quá timeout_ms mà chưa có dòng nào. buf luôn kết thúc bằng '\0'.
-int UART_ReadLine(char *buf, int size, uint32_t timeout_ms)
-{
-    int n = 0;
-    uint32_t t0 = HAL_GetTick();
-    while (HAL_GetTick() - t0 < timeout_ms) {
-        uint8_t c;
-        if (HAL_UART_Receive(&huart1, &c, 1, 10) != HAL_OK) {
-            __HAL_UART_CLEAR_OREFLAG(&huart1);  // Tràn (gõ nhanh hơn đọc) thì bỏ, đọc tiếp
-            continue;
-        }
-        if (c == '\r' || c == '\n') {
-            if (n > 0) break;                 // Hết dòng
-            continue;                         // Dòng trống: bỏ qua
-        }
-        if (n < size - 1) buf[n++] = (char)c;
-    }
-    buf[n] = '\0';
-    return (n > 0) ? n : -1;
-}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -216,6 +196,8 @@ int main(void)
   // Motor_SetSpeed(300.0f, 300.0f);   // tăng tốc dần lên 300 mm/s
   // Motor_SetSpeed(0.0f, 0.0f);       // giảm tốc dần rồi dừng
   // Motor_Stop();                     // dừng ngay, tắt PID
+  //print_LED();
+  // PID_Test(1);
   // gọi print_SpeedPID() trong while(1) để xem đáp ứng
   // PID_Test(0);                      // chạy bài test PID rồi in báo cáo (bỏ 2 dòng trong while(1))
   // PID_Test(1);                      // như trên, in thêm dữ liệu thô từng 2ms để vẽ đồ thị
@@ -224,14 +206,26 @@ int main(void)
   // MPU6500_Test(60);                 // đo nhiễu IMU khi tắt PWM / PWM băm xung / bánh quay + 60s theo dõi
                                        // bias gyro theo nhiệt độ (KÊ BÁNH LÊN), xong chờ mở cổng COM rồi in
   // Rectangle_Test(300.0f, 200.0f);   // đi hình chữ nhật 30x20cm quay phải, về chỗ cũ (ĐẶT TRÊN SÀN), xong chờ COM rồi in
-  // Straight_Test(500.0f);            // đi thẳng 500mm (số tự nhập, âm = lùi), xong chờ COM rồi in báo cáo
-   //Straight_Log_UART(1000.0f);       // gửi 1 ký tự qua Bluetooth -> đi thẳng 1m, vừa chạy vừa in yaw gyro/encoder qua HC-05
-  // Move_Straight(180.0f); Turn_Right(90.0f); Turn_Left(90.0f);   // các lệnh lẻ (chờ xong mới chạy lệnh sau)
+  // Straight_Test(500.0f, 250.0f);    // đi thẳng 500mm (âm = lùi), tốc độ 250mm/s, xong chờ COM rồi in báo cáo
+//   print_mpu6500();                  // in giá trị MPU sau bộ lọc qua USART1 (HC-05), gọi lặp trong while(1)
+  // Move_Straight(180.0f, 250.0f); Turn_Right(90.0f); Turn_Left(90.0f);   // các lệnh lẻ (chờ xong mới chạy lệnh sau)
+  // Move_Straight(0.0f, 0.0f);       // tốc độ 0: ĐỨNG GIỮ HƯỚNG, trả về ngay, xoay tay thì xe tự quay về
+                                       // (giữ tới lệnh chuyển động khác; while(1) vẫn chạy, vd in print_mpu6500)
+  // GIẢI MÊ CUNG (solving_maze.c): đặt xe ở TÂM ô xuất phát, mũi ra lối mở, đứng yên rồi:
+   Maze_Init(); while (Maze_Step() != MAZE_STATE_FINISHED && Maze_GetState() != MAZE_STATE_ERROR) {}
+   Maze_SendMap();                   // gửi bản đồ đã vạch qua UART (HC-05) cho maze/maze_viewer.py
   while (1)
   {
-	 // Straight_Log_UART(1000.0f);
-	  Heading_PID_Test(1200.0f, 0);
-	  HAL_Delay(1000);
+	  // maze_viewer.py gửi 1 ký tự để xin bản đồ -> gửi lại (mở chương trình lúc nào cũng nhận được)
+	  UART_WaitStart("Gui 1 ky tu de nhan ban do me cung\r\n");
+	  Maze_SendMap();
+
+	 // Move_Straight(0.0f, 0.0f);
+	//  print_LED();
+	 
+	  // 2s để bỏ tay ra, xe nằm yên trên sàn
+	          // quay TRÁI 10 vòng theo gyro rồi dừng (âm = quay phải)
+
 
     /* USER CODE END WHILE */
 
@@ -326,7 +320,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_4;
   sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_84CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_112CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();

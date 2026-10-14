@@ -14,10 +14,9 @@
   */
 #include "pid.h"
 #include "mpu6500.h"        // yaw_angle, imu_ready cho giữ hướng / quay
+#include "adc.h"            // adc_value[]: IR trước làm mốc cho Gyro_Spin_Calibrate
 #include <math.h>           // sqrtf, fabsf, sinf, cosf
 #include <stdio.h>          // snprintf
-#include <stdlib.h>         // abs
-#include <string.h>         // memset
 
 #define DEG2RAD               (3.14159265f / 180.0f)
 
@@ -41,8 +40,17 @@ static uint16_t prev_cnt_right = 0;
 // Bánh nhỏ hơn thì cùng PWM cho ra ít mm/s hơn -> Kf, Ka, Kp, Ki tỉ lệ nghịch với đường kính bánh
 // Các số trên đo khi còn tính bánh 30mm; nay dùng đường kính hiệu dụng (pid.h) -> Kf, Ka nhân 30/D để
 // PWM ra vẫn như cũ: trái 30/29.24, phải 30/29.03 (Kp, Ki lệch ~3% không đáng kể, giữ nguyên)
-PID_TypeDef pid_speed_left  = { .Ks = 80.0f, .Kf = 4.98f, .Ka = 0.174f, .Kp = 1.5f, .Ki = 30.0f, .Kd = 0.0f, .out_min = -PWM_MAX, .out_max = PWM_MAX };
-PID_TypeDef pid_speed_right = { .Ks = 85.0f, .Kf = 5.12f, .Ka = 0.176f, .Kp = 1.5f, .Ki = 30.0f, .Kd = 0.0f, .out_min = -PWM_MAX, .out_max = PWM_MAX };
+// Kp, Ki (10/10/2026, 8 lần PID_Test với 1.5/30): bánh phải bám tốt mọi lần (RMS ~6.5 mm/s = nhiễu lượng tử),
+// bánh TRÁI mỗi vòng bánh (~92mm) có 1 chỗ KẸT CƠ KHÍ: tụt còn 25-45% vận tốc dù PWM thừa 500-1000 so với
+// feedforward (RMS 25-44 mm/s). Kp 1.5 / Ki 30 quá chậm (băng thông ~6 rad/s) -> chỗ kẹt qua rồi mới bù xong.
+// 5/150: Ki/Kp = 30 ~ 1/tau động cơ (35ms) -> vòng kín ~ bậc 1, tau ~ 35ms. Mô phỏng khớp data:
+//   bánh trái kẹt: RMS 34 -> 21 mm/s, tụt thấp nhất 23% -> 63% vận tốc đặt; bánh tốt: không xấu đi
+//   (vẫn ổn khi tau 25-50ms và trễ thêm 2 chu kỳ). Đổi lại PWM rung theo nhiễu encoder ~12 -> ~43 mỗi 2ms
+//   (~1.4% duty, động cơ lọc mất). Chỗ kẹt phải sửa cơ khí, PID chỉ giảm được ảnh hưởng.
+// Đã sửa cơ khí bánh trái, đo lại 24 lần với 5/150: cả 2 bánh RMS 6.1-6.6 mm/s (chỉ còn nhiễu lượng tử),
+//   0 mẫu lệch > 35 mm/s, sai số xác lập |TB| < 2.6 mm/s, Bam_max 18-32, 2 bánh như nhau -> giữ 5/150.
+PID_TypeDef pid_speed_left  = { .Ks = 80.0f, .Kf = 4.98f, .Ka = 0.174f, .Kp = 5.0f, .Ki = 150.0f, .Kd = 0.0f, .out_min = -PWM_MAX, .out_max = PWM_MAX };
+PID_TypeDef pid_speed_right = { .Ks = 85.0f, .Kf = 5.12f, .Ka = 0.176f, .Kp = 5.0f, .Ki = 150.0f, .Kd = 0.0f, .out_min = -PWM_MAX, .out_max = PWM_MAX };
 uint8_t motor_hw_ok = 0;                   // 1: PB0/PA3 đã là chân PWM (CubeMX), 0: khóa động cơ
 volatile float target_speed_left  = 0.0f;  // Vận tốc mong muốn (mm/s), đặt bằng Motor_SetSpeed()
 volatile float target_speed_right = 0.0f;
@@ -61,69 +69,40 @@ static const float pid_test_speeds[PID_TEST_STAGES] = { 200.0f, 300.0f, 150.0f, 
 // Vòng ngoài (ngắt TIM9 ghi, luồng chính đọc)
 float dist_left_mm = 0.0f, dist_right_mm = 0.0f;
 float odo_x_mm = 0.0f, odo_y_mm = 0.0f;
-float enc_heading_deg = 0.0f;
-typedef enum { MOTION_IDLE, MOTION_STRAIGHT, MOTION_TURN } MotionMode;
-typedef enum { MOTION_OK, MOTION_RUNNING, MOTION_ABORT, MOTION_TIMEOUT, MOTION_NOT_READY } MotionResult;
+// MOTION_HOLD: đứng giữ hướng + lùi khỏi tường quá gần + tự căn vuông góc với tường trước (Hold_Update)
+typedef enum { MOTION_IDLE, MOTION_STRAIGHT, MOTION_TURN, MOTION_HOLD } MotionMode;
+// MOTION_WALL: đi thẳng bị tường trước chặn (ngắt đặt) / đã căn xong (Wall_Align đặt)
+typedef enum { MOTION_OK, MOTION_RUNNING, MOTION_ABORT, MOTION_TIMEOUT, MOTION_NOT_READY, MOTION_LIFTED,
+               MOTION_WALL, MOTION_WALL_FAIL } MotionResult;
 static volatile MotionMode   motion_mode   = MOTION_IDLE;
 static volatile MotionResult motion_result = MOTION_OK;
 static volatile float heading_target   = 0.0f;   // Hướng cần giữ / cần quay tới (độ, TUYỆT ĐỐI -> sai số không cộng dồn)
 static volatile float move_start_mm    = 0.0f;   // Quãng đường tâm xe lúc bắt đầu đoạn đi thẳng
 static volatile float move_target_mm   = 0.0f;
+static volatile float move_speed_mms   = MOVE_SPEED_MMS;   // Tốc độ tối đa của đoạn đi thẳng đang chạy
+static volatile uint8_t move_wall      = 0;      // 1: đoạn đi thẳng này dừng trước tường + tránh tường bên
 static volatile float motion_abort_deg = MOTION_ABORT_DEG;
 static volatile float motion_max_err   = 0.0f;   // Báo cáo: đi thẳng = |lệch hướng| lớn nhất, quay = góc vượt quá đích lớn nhất
 static volatile float motion_turn_dir  = 1.0f;   // Chiều quay đang chạy: 1 trái, -1 phải
-static volatile float heading_integral = 0.0f;   // Tích phân lệch hướng của PID giữ hướng (độ.s)
-static volatile float motion_w_corr    = 0.0f;   // Tốc độ sửa hướng PID vừa ra (độ/s), để in log
+uint8_t wall_guard = 1;
+uint8_t wall_center = 1;
+static float wall_center_e = 0.0f;               // Lệch ngang tương đối đã lọc (dương = lệch trái, xem WALL_CENTER_)
+static float wall_gain = 0.0f;                  // Độ nhạy căn tường g (r / độ) đã đo, 0 = chưa đo (xem pid.h)
+static float wall_gain_ir = 0.0f;                // TB 2 mắt trước lúc đo g (g đổi theo khoảng cách)
+static float heading_rate_f = 0.0f;              // Tốc độ quay (gyro) đã lọc cho khâu D (độ/s, dương = trái)
+static volatile uint8_t hold_active = 0;         // Đứng giữ hướng: 1 = đang quay về hướng đích
 static uint8_t heading_set = 0;                  // 0: chưa lấy hướng gốc
+float yaw_scale = YAW_SCALE;                     // Độ nhạy gyro đang dùng (Gyro_Spin_Calibrate sửa lúc chạy)
 
-// Đo ngắt TIM9 bằng bộ đếm chu kỳ CPU (DWT->CYCCNT, 60MHz): chu kỳ giữa 2 lần ngắt + thời gian xử lý.
-// Chứng minh in UART (luồng chính) có làm trễ / chen vào vòng điều khiển hay không
+// Ghi dữ liệu cho Gyro_Spin_Calibrate (ngắt TIM9 ghi 1 mẫu / SPIN_CAL_DECIM chu kỳ khi spin_rec_n < SPIN_CAL_MAX)
 typedef struct {
-    uint32_t n;
-    uint32_t period_min, period_max;      // Chu kỳ CPU giữa 2 lần vào Motor_Speed_Tick (chuẩn 120000 = 2ms)
-    uint32_t exec_max;                    // Chu kỳ CPU xử lý Motor_Speed_Tick lâu nhất
-} TickStat;
-static volatile TickStat tick_stat;
-static uint32_t tick_last_cyc = 0;
-static void TickStat_Reset(void)
-{
-    tick_stat.n = 0;                      // Ngắt thấy n = 0 thì chỉ lấy mốc, chưa tính chu kỳ
-    tick_stat.period_min = UINT32_MAX;
-    tick_stat.period_max = 0;
-    tick_stat.exec_max = 0;
-}
-// Ghi dữ liệu cho Straight_IMU_Test (ngắt TIM9 ghi 1 mẫu / 2ms khi imu_rec_n < IMU_REC_MAX)
-typedef struct {
-    int16_t g[3], a[3];                   // Gyro x y z, accel x y z (số thô MPU)
-    int16_t w_pid;                        // Tốc độ sửa hướng PID x10 (độ/s)
-    int8_t  enc_l, enc_r;                 // Xung encoder trong 2ms này
-    uint8_t phase;                        // Giai đoạn test (REC_*)
-    uint8_t fresh;                        // 1: IMU có mẫu mới kể từ lần ghi trước (0 = lặp mẫu cũ)
-} ImuRec;
-enum { REC_STILL, REC_UART, REC_MOVE, REC_AFTER, REC_PHASES };
-// Ghi dữ liệu cho Heading_PID_Test (mỗi 2ms khi head_rec_n < HEAD_REC_MAX), đơn vị nguyên để tiết kiệm RAM
-typedef struct {
-    int16_t ref;                          // Bậc hướng đích so với hướng gốc (0.01 độ)
-    int16_t y;                            // Hướng thật theo gyro so với hướng gốc (0.01 độ)
-    int16_t enc;                          // Hướng theo encoder so với lúc xuất phát (0.01 độ)
-    int16_t rate;                         // Tốc độ quay gyro (0.1 độ/s)
-    int16_t w_pid;                        // Tốc độ sửa hướng PID ra (0.1 độ/s)
-} HeadRec;
-// 2 bài test không chạy cùng lúc -> dùng chung 1 vùng nhớ (54KB)
-static union {
-    ImuRec  imu[IMU_REC_MAX];
-    HeadRec head[HEAD_REC_MAX];
-} rec_buf;
-static volatile uint16_t imu_rec_n = IMU_REC_MAX; // = IMU_REC_MAX: không ghi
-static volatile uint8_t  imu_rec_phase = REC_STILL;
-static uint32_t imu_rec_last_count = 0;
-static volatile uint16_t head_rec_n = HEAD_REC_MAX;   // = HEAD_REC_MAX: không ghi
-static float head_enc0 = 0.0f;                        // enc_heading_deg lúc bắt đầu ghi
-
-// PID giữ hướng đang dùng: khởi đầu theo pid.h, Heading_PID_Test đổi được qua Bluetooth
-float heading_kp = HEADING_KP, heading_ki = HEADING_KI, heading_kd = HEADING_KD;
-static volatile float heading_step_deg = 0.0f;   // Heading_PID_Test: bậc cộng thêm vào hướng đích khi đi thẳng
-static HAL_StatusTypeDef rezero_status = HAL_OK; // Kết quả chỉnh offset gyro lần gần nhất (Motion_Begin)
+    float    h;                           // Hướng theo gyro (độ, độ nhạy CŨ)
+    float    dd;                          // Quãng đường bánh phải - bánh trái (mm)
+    uint16_t ir;                          // IR trước-trái + trước-phải (ADC)
+} SpinRec;
+static SpinRec spin_rec[SPIN_CAL_MAX];
+static volatile uint16_t spin_rec_n = SPIN_CAL_MAX;   // = SPIN_CAL_MAX: không ghi
+static uint8_t spin_rec_div = 0;
 
 static char msg[200];                      // Bộ đệm in USB của module này
 
@@ -161,9 +140,10 @@ void Motor_Write(volatile uint32_t *ccr_in1, volatile uint32_t *ccr_in2, int32_t
         *ccr_in2 = (uint32_t)(PWM_PERIOD + duty);  // = PWM_PERIOD - |duty|
     }
 }
-// Xuất duty cho cả 2 động cơ, dương = chạy tới, 0 = phanh
+// Xuất duty cho cả 2 động cơ, dương = chạy tới, 0 = phanh. Xe đang bị nhấc: luôn phanh
 void Motor_SetPWM(int32_t left, int32_t right)
 {
+    if (robot_lifted) left = right = 0;
     pwm_left  = left;
     pwm_right = right;
     Motor_Write(&MOTOR_L_IN1_CCR, &MOTOR_L_IN2_CCR, MOTOR_L_SIGN * left);
@@ -189,11 +169,6 @@ void Motor_Init(void)
     HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
     prev_cnt_left  = TIM3->CNT;
     prev_cnt_right = TIM2->CNT;
-    // Bật bộ đếm chu kỳ CPU (DWT) để đo ngắt TIM9 - chạy được cả khi không cắm mạch nạp
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    TickStat_Reset();
     //Tắt Động Cơ: IN1 = 1, IN2 = 1 -> phanh (chưa đổi chân trong CubeMX thì thả trôi)
     Motor_SetPWM(0, 0);
 }
@@ -252,7 +227,6 @@ float Ramp(float current, float target, float max_step)
     return target;
 }
 static void Motion_Update(void);
-static float Clamp(float x, float limit);
 // Vòng PID vận tốc, gọi trong ngắt TIM9 mỗi 2ms với số xung encoder vừa đếm được
 void Motor_Speed_Control(int16_t delta_left, int16_t delta_right)
 {
@@ -269,8 +243,6 @@ void Motor_Speed_Control(int16_t delta_left, int16_t delta_right)
     //     số xung x mm/xung, không bị trễ của bộ lọc (vận tốc đã lọc làm quãng đường hụt ~1.4mm khi chạy 300mm/s)
     dist_left_mm  += raw_left  * CONTROL_DT;
     dist_right_mm += raw_right * CONTROL_DT;
-    // Góc quay chỉ theo encoder (so sánh với gyro): chênh quãng đường 2 bánh / khoảng cách 2 bánh
-    enc_heading_deg += (raw_right - raw_left) * CONTROL_DT / TRACK_WIDTH_MM / DEG2RAD;
     float d_center = 0.5f * (raw_left + raw_right) * CONTROL_DT;
     if (d_center != 0.0f) {               // Vị trí ước lượng: tâm xe đi d_center theo hướng gyro
         float h = Robot_Heading() * DEG2RAD;
@@ -278,34 +250,23 @@ void Motor_Speed_Control(int16_t delta_left, int16_t delta_right)
         odo_y_mm += d_center * sinf(h);
     }
 
-    // 1c. Vòng ngoài đang đi thẳng / quay thì nó đặt vận tốc cho 2 bánh
+    // 1c. Lọc nhiễu IR (vòng ngoài dùng để dừng trước tường / tránh tường bên / căn tường)
+    IR_Tick();
+
+    // 1d. Xe bị nhấc mà vẫn còn lệnh chạy (luồng chính vừa bật lại đúng lúc nhấc): tắt lại
+    if (robot_lifted && (motor_pid_enable || motion_mode != MOTION_IDLE)) Motion_OnLifted();
+
+    // 1e. Vòng ngoài đang đi thẳng / quay thì nó đặt vận tốc cho 2 bánh
     Motion_Update();
 
-    // 1d. Straight_IMU_Test đang ghi: lưu mẫu IMU mới nhất + encoder + PID hướng
-    if (imu_rec_n < IMU_REC_MAX) {
-        ImuRec *r = &rec_buf.imu[imu_rec_n];
-        uint32_t cnt = imu_sample_count;
-        r->fresh = (cnt != imu_rec_last_count);
-        imu_rec_last_count = cnt;
-        for (int i = 0; i < 3; i++) {
-            r->a[i] = imu_raw[i];
-            r->g[i] = imu_raw[4 + i];
-        }
-        r->w_pid = (int16_t)(motion_w_corr * 10.0f);
-        r->enc_l = (int8_t)((delta_left  > 127) ? 127 : (delta_left  < -127) ? -127 : delta_left);
-        r->enc_r = (int8_t)((delta_right > 127) ? 127 : (delta_right < -127) ? -127 : delta_right);
-        r->phase = imu_rec_phase;
-        imu_rec_n++;
-    }
-    // 1e. Heading_PID_Test đang ghi
-    if (head_rec_n < HEAD_REC_MAX) {
-        HeadRec *h = &rec_buf.head[head_rec_n];
-        h->ref   = (int16_t)(heading_step_deg * 100.0f);
-        h->y     = (int16_t)Clamp((Robot_Heading() - heading_target) * 100.0f, 32000.0f);
-        h->enc   = (int16_t)Clamp((enc_heading_deg - head_enc0) * 100.0f, 32000.0f);
-        h->rate  = (int16_t)Clamp(yaw_rate_dps * 10.0f, 32000.0f);
-        h->w_pid = (int16_t)(motion_w_corr * 10.0f);
-        head_rec_n++;
+    // 1f. Gyro_Spin_Calibrate đang ghi: hướng gyro + chênh quãng đường 2 bánh + IR trước
+    if (spin_rec_n < SPIN_CAL_MAX && ++spin_rec_div >= SPIN_CAL_DECIM) {
+        spin_rec_div = 0;
+        SpinRec *r = &spin_rec[spin_rec_n];
+        r->h  = Robot_Heading();
+        r->dd = dist_right_mm - dist_left_mm;
+        r->ir = adc_value[0] + adc_value[3];
+        spin_rec_n++;
     }
 
     // 2. PID tắt: thả động cơ đúng 1 lần (để main vẫn test PWM tay được), giữ PID sạch
@@ -345,14 +306,6 @@ void Motor_Speed_Control(int16_t delta_left, int16_t delta_right)
 // Ngắt TIM9 mỗi 2ms: đếm xung encoder vừa chạy được rồi chạy vòng PID vận tốc
 void Motor_Speed_Tick(void)
 {
-    uint32_t c0 = DWT->CYCCNT;            // Đo chu kỳ ngắt (xem TickStat)
-    if (tick_stat.n++ > 0) {
-        uint32_t period = c0 - tick_last_cyc;
-        if (period < tick_stat.period_min) tick_stat.period_min = period;
-        if (period > tick_stat.period_max) tick_stat.period_max = period;
-    }
-    tick_last_cyc = c0;
-
     uint16_t curr_cnt_left = TIM3->CNT;
     uint16_t curr_cnt_right = TIM2->CNT;
 
@@ -363,9 +316,6 @@ void Motor_Speed_Tick(void)
     prev_cnt_right = curr_cnt_right;
 
     Motor_Speed_Control(delta_pulse_left, delta_pulse_right);
-
-    uint32_t exec = DWT->CYCCNT - c0;
-    if (exec > tick_stat.exec_max) tick_stat.exec_max = exec;
 }
 // ĐẶT VẬN TỐC MONG MUỐN cho 2 bánh (mm/s, dương = chạy tới, âm = chạy lùi)
 // Gọi lúc nào cũng được; xe tăng/giảm tốc dần tới giá trị mới. Đặt (0, 0) để giảm tốc rồi dừng.
@@ -378,6 +328,10 @@ void Motor_SetSpeed(float left_mms, float right_mms)
     if (right_mms < -MAX_SPEED_MMS) right_mms = -MAX_SPEED_MMS;
 
     motion_mode        = MOTION_IDLE;          // Trước khi ghi vận tốc: ngắt không ghi đè lại nữa
+    if (robot_lifted) {                        // Xe đang bị nhấc: không cho chạy
+        Motor_Stop();
+        return;
+    }
     target_speed_left  = left_mms;
     target_speed_right = right_mms;
     motor_pid_enable   = 1;
@@ -400,7 +354,7 @@ void Motor_Stop(void)
 // lần quay sau vẫn nhắm đúng góc gốc -> sai số không cộng dồn qua các góc của hình chữ nhật.
 float Robot_Heading(void)
 {
-    return YAW_SCALE * yaw_angle;
+    return yaw_scale * yaw_angle;
 }
 static float Robot_Distance(void)         // Quãng đường tâm xe (mm)
 {
@@ -420,47 +374,394 @@ static float Motion_Profile(float remaining, float v_max, float decel)
     if (v > v_max) v = v_max;
     return (remaining >= 0.0f) ? v : -v;
 }
+// Vận tốc tối đa khi thấy tường trước (IR front, thang IRFR): từ move_speed_mms ở WALL_SLOW_IR giảm tới
+// WALL_APPROACH_MMS ở WALL_TARGET_IR. Nội suy v^2 theo 1/sqrt(IR) (~ khoảng cách nếu IR ~ 1/d^2) -> hãm gần đều
+static float Wall_SpeedLimit(float front)
+{
+    float v_max = move_speed_mms, v_min = WALL_APPROACH_MMS;
+    if (front <= WALL_SLOW_IR || v_max <= v_min) return v_max;
+    float u_t = 1.0f / sqrtf(WALL_TARGET_IR), u_s = 1.0f / sqrtf(WALL_SLOW_IR);
+    float frac = (1.0f / sqrtf(front) - u_t) / (u_s - u_t);   // 1: ở WALL_SLOW_IR, 0: ở WALL_TARGET_IR
+    if (frac < 0.0f) frac = 0.0f;
+    return sqrtf(v_min * v_min + (v_max * v_max - v_min * v_min) * frac);
+}
+// Cân giữa ô (đi thẳng tới, xem WALL_CENTER_ ở pid.h): góc lái thêm (độ, dương = sang trái) từ 2 mắt bên.
+// v: vận tốc đặt hiện tại, front: mắt trước gần hơn. Không có tường bên / tường trước quá gần: 0 (chỉ giữ hướng gyro)
+static float Wall_CenterOffset(float v, float front)
+{
+    float l = IR_L_Filt(), r = IR_R_Filt();
+    float l0 = IR_L_ToRef((uint16_t)WALL_CENTER_L_IR), r0 = WALL_CENTER_R_IR;   // Cùng thang với IR_L_Filt / IR_R_Filt
+    uint8_t has_l = l >= IR_L_ToRef((uint16_t)WALL_SIDE_PRESENT_IR);           // Ngưỡng theo IRL thô của print_LED
+    uint8_t has_r = r >= WALL_SIDE_PRESENT_IR;
+    if (front > WALL_CENTER_FRONT_IR || (!has_l && !has_r)) {
+        wall_center_e = 0.0f;
+        return 0.0f;
+    }
+    float el = has_l ? 1.0f - sqrtf(l0 / l) : 0.0f;    // Lệch trái theo tường trái
+    float er = has_r ? sqrtf(r0 / r) - 1.0f : 0.0f;    // Lệch trái theo tường phải
+    float e  = (has_l && has_r) ? 0.5f * (el + er) : el + er;
+    wall_center_e += (CONTROL_DT / (WALL_CENTER_TAU_S + CONTROL_DT)) * (e - wall_center_e);
+    float k_v = fminf(v / WALL_CENTER_FULL_MMS, 1.0f);   // Chậm thì lái ít (đứng yên: 0)
+    return Clamp(-WALL_CENTER_KP * wall_center_e, WALL_CENTER_MAX_DEG) * k_v;
+}
+// ===== ĐỨNG GIỮ HƯỚNG + TƯỜNG TRƯỚC (MOTION_HOLD, chạy trong ngắt TIM9 mỗi 2ms) =====
+// Đứng yên giữ hướng (xoay tay thì quay về). Có wall_guard:
+//   - mắt trước > WALL_STOP_IR: lùi chậm (vẫn giữ hướng) tới dưới WALL_TARGET_IR -> luôn IR < WALL_STOP_IR
+//   - CÓ TƯỜNG = cả 2 mắt trước >= WALL_PRESENT_IR (600). Xe đứng yên: còn xa thì tiến chậm tới ~WALL_TARGET_IR,
+//     dừng, tự căn vuông góc, rồi đo lại offset gyro Z và ĐẶT LẠI HƯỚNG MPU: hướng vuông góc với tường = hướng đang
+//     giữ (ws_href)
+// Căn tường (mô hình gần vuông góc: lệch r = (FL - FR)/(FL + FR) = g x (hướng - hướng vuông góc)):
+//   WS_IDLE  chờ đứng yên WALL_SETTLE_MS. Mắt gần hơn > đích + WALL_DIST_TOL_IR: lùi về đích; < đích - WALL_DIST_START_IR:
+//            tiến tới đích (phanh sớm theo tốc độ tăng IR như khi đi thẳng). Đúng khoảng cách thì đo
+//   WS_MEAS  đo r trung bình WALL_MEAS_N mẫu. g chưa biết: quay thử WALL_PROBE_DEG, đo lại -> g (cả chiều).
+//            Còn lệch -r/g: đủ nhỏ -> WS_ZERO, chưa -> quay chỉnh (WS_TURN), đo lại, cập nhật g theo cát tuyến
+//   WS_TURN  quay chỉnh nhỏ: ít nhất HOLD_MIN_DPS, phanh sớm bù đoạn trôi, vượt đích là dừng (không quay ngược)
+//   WS_ZERO  đo lại offset gyro Z (như MPU6500_ZeroGyroZ, không chặn) rồi đặt hướng -> WS_DONE
+//   WS_DONE  đã vuông góc. Bị xoay tay / tường lệch > WALL_REALIGN_DEG / mất tường -> WS_IDLE (căn lại khi có tường)
+//   WS_FAIL  không căn được: giữ hướng cũ, MPU không đổi. Thử lại khi mất tường rồi có lại
+typedef enum { WS_IDLE, WS_MEAS, WS_TURN, WS_ZERO, WS_DONE, WS_FAIL } WallState;
+static volatile WallState ws = WS_IDLE;
+static volatile uint8_t ws_force = 0;     // Wall_Align đang chờ: không thấy tường -> WS_FAIL (thay vì chờ mãi)
+static uint8_t  ws_backing = 0;           // Đang lùi ra xa tường
+static uint8_t  ws_approach = 0;          // Đang tiến lại gần tường (tới WALL_TARGET_IR)
+static float    ws_appr_mm;               // Quãng đường lúc bắt đầu tiến (giới hạn WALL_APPROACH_MAX_MM)
+static uint16_t ws_still = 0;             // Số chu kỳ 2 bánh đứng yên liên tục
+static uint16_t ws_busy = 0;              // Số chu kỳ đang căn (có tường, chưa xong / hỏng), giới hạn WALL_ALIGN_MAX_MS
+static uint16_t ws_n = 0;                 // Đếm mẫu / chu kỳ trong WS_MEAS, WS_TURN, WS_ZERO
+static float    ws_fl, ws_fr;             // Tổng IR khi đo
+static float    ws_r, ws_h;               // Lần đo trước: lệch r, hướng gyro
+static float    ws_h0;                    // Hướng lúc bắt đầu căn (giới hạn WALL_ALIGN_MAX_DEG)
+static float    ws_href;                  // Hướng đang giữ = hướng sẽ gán cho pháp tuyến tường
+static float    ws_hperp;                 // Hướng gyro lúc vuông góc (hệ trước khi đặt lại)
+static float    ws_prev_step, ws_dir, ws_rf;
+static uint8_t  ws_it, ws_probe, ws_latched;
+static uint32_t wz_last;                  // WS_ZERO: imu_sample_count lần trước
+static float    wz_sum, wz_sq, wz_half;
+
+static void Wall_Reset(void)              // Gọi khi bắt đầu MOTION_HOLD (ngắt chưa chạy chế độ này)
+{
+    ws          = WS_IDLE;
+    ws_backing  = 0;
+    ws_approach = 0;
+    ws_still    = 0;
+    ws_busy     = 0;
+}
+static void Wall_Fail(void)
+{
+    wall_gain      = 0.0f;                // Lần sau đo lại g
+    heading_target = ws_href;             // Về hướng đang giữ trước khi căn
+    ws = WS_FAIL;
+}
+static void Wall_TurnTo(float h)
+{
+    heading_target = h;
+    ws_dir     = (h >= Robot_Heading()) ? 1.0f : -1.0f;
+    ws_latched = 0;
+    ws_n       = 0;
+    ws         = WS_TURN;
+}
+static void Wall_StartMeas(void)
+{
+    ws_fl = ws_fr = 0.0f;
+    ws_n  = 0;
+    ws    = WS_MEAS;
+}
+// Hướng vuông góc với tường = ws_href. Xe còn lệch (Robot_Heading - ws_hperp) so với vuông góc (< WALL_ALIGN_ACCEPT_DEG)
+// -> giữ phần lệch đó. yaw_angle chỉ bị ghi trong ngắt (cùng mức ưu tiên với ngắt I2C) -> không cần tắt ngắt
+static void Wall_SetHeading(void)
+{
+    yaw_angle      = (ws_href + Robot_Heading() - ws_hperp) / yaw_scale;
+    heading_target = ws_href;
+    ws = WS_DONE;
+}
+// Đo xong WALL_MEAS_N mẫu: quay thử / quay chỉnh / xong
+static void Wall_Evaluate(void)
+{
+    float fl = ws_fl / ws_n, fr = ws_fr / ws_n, h = Robot_Heading();
+    if (fminf(fl, fr) < WALL_PRESENT_IR) {
+        Wall_Fail();
+        return;
+    }
+    float r = (fl - fr) / (fl + fr) - WALL_R_OFFSET;
+    if (wall_gain == 0.0f) {
+        if (!ws_probe) {                  // Chưa biết g: quay thử, gyro đo góc đã quay thật
+            ws_r = r;
+            ws_h = h;
+            ws_probe = 1;
+            Wall_TurnTo(h + WALL_PROBE_DEG);
+            return;
+        }
+        ws_probe = 0;
+        float g = (fabsf(h - ws_h) >= 0.5f * WALL_PROBE_DEG) ? (r - ws_r) / (h - ws_h) : 0.0f;
+        if (fabsf(g) < WALL_MIN_GAIN) {   // Không quay được / IR gần như không đổi khi quay: không phải tường phẳng
+            Wall_Fail();
+            return;
+        }
+        wall_gain    = g;
+        wall_gain_ir = 0.5f * (fl + fr);
+    } else if (ws_it > 0 && fabsf(h - ws_h) > 1.0f) {
+        // Bước quay đủ lớn: cập nhật g theo cát tuyến, chỉ nhận giá trị cùng chiều và không quá khác (nhiễu)
+        float g = (r - ws_r) / (h - ws_h);
+        if (g * wall_gain > 0.0f && fabsf(g) > 0.5f * fabsf(wall_gain) && fabsf(g) < 2.0f * fabsf(wall_gain)) {
+            wall_gain    = g;
+            wall_gain_ir = 0.5f * (fl + fr);
+        }
+    }
+    float step = -r / wall_gain;          // Còn phải quay (độ)
+    // Xong: lệch < WALL_ALIGN_TOL_DEG, hoặc lần quay vừa rồi đã vượt qua vuông góc (đổi chiều) mà còn lệch
+    // < WALL_ALIGN_ACCEPT_DEG: bánh cần ~470 PWM mới nhích nên lần quay nhỏ nhất ~1.5 độ, quay tiếp chỉ vọt qua lại
+    if (fabsf(step) < WALL_ALIGN_TOL_DEG || (fabsf(step) < WALL_ALIGN_ACCEPT_DEG && step * ws_prev_step < 0.0f)) {
+        ws_hperp = h + step;
+        ws_rf    = r;
+#if WALL_REZERO_GYRO
+        wz_sum = wz_sq = wz_half = 0.0f;
+        wz_last = imu_sample_count;
+        ws_n = 0;
+        ws   = WS_ZERO;
+#else
+        Wall_SetHeading();
+#endif
+        return;
+    }
+    if (ws_it >= WALL_ALIGN_ITERS || fabsf(h + step - ws_h0) > WALL_ALIGN_MAX_DEG) {
+        Wall_Fail();
+        return;
+    }
+    ws_prev_step = step;
+    ws_r = r;
+    ws_h = h;
+    ws_it++;
+    Wall_TurnTo(h + step);
+}
+// Đo lại offset gyro Z không chặn: TB GYRO_REZERO_SAMPLES mẫu thô (kiểm tra nhiễu + nửa đầu/nửa sau như
+// MPU6500_ZeroGyroZ; bị chạm / xoay chậm thì giữ offset cũ), rồi đặt hướng
+static void Wall_ZeroTick(void)
+{
+    if (imu_sample_count == wz_last) return;   // Chờ mẫu IMU mới
+    wz_last = imu_sample_count;
+    float g = imu_raw[6];
+    wz_sum += g;
+    wz_sq  += g * g;
+    if (++ws_n == GYRO_REZERO_SAMPLES / 2) wz_half = wz_sum;
+    if (ws_n < GYRO_REZERO_SAMPLES) return;
+    float mean  = wz_sum / ws_n, var = wz_sq / ws_n - mean * mean;
+    float drift = (wz_half - (wz_sum - wz_half)) / (GYRO_REZERO_SAMPLES / 2) / 16.4f;
+    if (!(var > 0.0f && sqrtf(var) / 16.4f > GYRO_CAL_MAX_STD_DPS) && fabsf(drift) <= GYRO_CAL_MAX_DRIFT_DPS)
+        gyro_z_offset = mean;
+    Wall_SetHeading();
+}
+// MOTION_HOLD mỗi 2ms: ra vận tốc tiến v + tốc độ quay w. head_err, w_pd: lệch hướng + PD giữ hướng,
+// front_rate: tốc độ tăng IR mắt trước gần hơn (/s) (Motion_Update)
+static void Hold_Update(float head_err, float w_pd, float fl, float fr, float front_rate, float *v, float *w)
+{
+    float front   = fmaxf(fl, fr);
+    uint8_t wall  = wall_guard && fminf(fl, fr) >= WALL_PRESENT_IR;
+    uint8_t still = fabsf(speed_left_mms) < MOTION_STOP_MMS && fabsf(speed_right_mms) < MOTION_STOP_MMS;
+    if (!still) ws_still = 0;
+    else if (ws_still < 0xFFFF) ws_still++;
+
+    // 0. Giới hạn thời gian căn: có tường (hoặc Wall_Align đang chờ) mà quá WALL_ALIGN_MAX_MS chưa xong -> thôi căn.
+    //    Chưa quay chỉnh (WS_IDLE: đang tiến / lùi / chờ đứng yên) thì hướng đích chưa bị đổi -> chỉ báo hỏng
+    if ((wall || ws_force) && ws != WS_DONE && ws != WS_FAIL) {
+        if (++ws_busy > WALL_ALIGN_MAX_MS / 2) {
+            ws_approach = 0;
+            ws_backing  = 0;                  // Quá gần (> WALL_STOP_IR) thì bước 1 vẫn bật lùi lại ở chu kỳ sau
+            if (ws == WS_IDLE) ws = WS_FAIL;
+            else Wall_Fail();
+        }
+    } else {
+        ws_busy = 0;
+    }
+
+    // 1. Quá gần tường trước: lùi chậm, giữ hướng, tới dưới WALL_TARGET_IR thì thôi. Xong thì căn lại
+    if (wall_guard && front > WALL_STOP_IR) ws_backing = 1;
+    if (ws_backing) {
+        if (!wall_guard || front < WALL_TARGET_IR) {
+            ws_backing = 0;
+        } else {
+            *v = -WALL_CREEP_MMS;
+            *w = Clamp(w_pd, HEADING_MAX_DPS);
+            if (ws != WS_FAIL) ws = WS_IDLE;
+            ws_approach = 0;
+            return;
+        }
+    }
+    // 1b. Tường còn xa: tiến chậm, giữ hướng, sắp tới WALL_TARGET_IR (tính cả đoạn trôi khi phanh) thì dừng.
+    //     Mất tường thì thôi; đi quá WALL_APPROACH_MAX_MM mà chưa tới (tường lùi theo?) thì thôi căn
+    if (ws_approach) {
+        if (!wall || front + fmaxf(front_rate, 0.0f) * WALL_STOP_LEAD_S >= WALL_TARGET_IR) {
+            ws_approach = 0;
+        } else if (fabsf(Robot_Distance() - ws_appr_mm) > WALL_APPROACH_MAX_MM) {
+            ws_approach = 0;
+            Wall_Fail();
+        } else {
+            *v = WALL_CREEP_MMS;
+            *w = Clamp(w_pd, HEADING_MAX_DPS);
+            return;
+        }
+    }
+    // 2. Đang quay chỉnh để căn tường: phanh SỚM một đoạn = tốc độ quay x WALL_TURN_COAST_S (đoạn trôi khi phanh),
+    //    vào đó hoặc đã vượt đích là dừng hẳn. Đứng yên rồi thì lấy hướng thật làm đích (góc thật do gyro đo) và đo
+    if (ws == WS_TURN) {
+        if (++ws_n > WALL_TURN_TIMEOUT_MS / 2) {             // Kẹt bánh: thôi căn
+            Wall_Fail();
+            return;
+        }
+        if (fabsf(head_err) < WALL_TURN_TOL_DEG + fabsf(heading_rate_f) * WALL_TURN_COAST_S || head_err * ws_dir < 0.0f)
+            ws_latched = 1;
+        if (!ws_latched) {
+            *w = Motion_Profile(head_err, TURN_SPEED_DPS, TURN_DECEL_DPS2);
+            if (fabsf(*w) < HOLD_MIN_DPS) *w = (head_err > 0.0f) ? HOLD_MIN_DPS : -HOLD_MIN_DPS;
+        } else if (ws_still >= WALL_SETTLE_MS / 2) {
+            heading_target = Robot_Heading();
+            Wall_StartMeas();
+        }
+        return;
+    }
+    // 3. Giữ hướng: lệch nhỏ thì phanh đứng yên, lệch > HOLD_START_DEG (xoay tay, va) thì quay về (ít nhất
+    //    HOLD_MIN_DPS để thắng ma sát tĩnh), về trong HOLD_TOL_DEG thì phanh. Bị xoay thì căn tường lại sau đó
+    float a = fabsf(head_err);
+    if (a > HOLD_START_DEG) hold_active = 1;
+    else if (a < HOLD_TOL_DEG) hold_active = 0;
+    if (hold_active) {
+        *w = w_pd;
+        if (*w * head_err > 0.0f && fabsf(*w) < HOLD_MIN_DPS)     // Đang quay về: không chậm hơn mức tối thiểu
+            *w = (head_err > 0.0f) ? HOLD_MIN_DPS : -HOLD_MIN_DPS;
+        *w = Clamp(*w, HOLD_MAX_DPS);
+        if (ws != WS_FAIL) ws = WS_IDLE;
+        return;
+    }
+    // 4. Đứng yên: căn tường trước
+    if (!wall_guard) return;
+    float r = (fl + fr > 1.0f) ? (fl - fr) / (fl + fr) - WALL_R_OFFSET : 0.0f;
+    switch (ws) {
+    case WS_IDLE:
+        if (ws_still < WALL_SETTLE_MS / 2) break;
+        ws_href = heading_target;
+        if (!wall) {
+            if (ws_force) Wall_Fail();
+            break;
+        }
+        if (front > WALL_TARGET_IR + WALL_DIST_TOL_IR) {    // Quá đích: lùi về đích trước (quay căn đưa 1 mắt lại gần ~4%)
+            ws_backing = 1;
+            break;
+        }
+        if (front < WALL_TARGET_IR - WALL_DIST_START_IR) {  // Còn xa: tiến tới đích trước
+            ws_approach = 1;
+            ws_appr_mm  = Robot_Distance();
+            break;
+        }
+        // g đo ở khoảng cách khác nhiều (TB 2 mắt lệch > 30%) thì đo lại: g đổi theo khoảng cách, mắt gắn chụm vào
+        // còn có thể đổi chiều
+        if (wall_gain != 0.0f && fabsf(0.5f * (fl + fr) - wall_gain_ir) > 0.3f * wall_gain_ir) wall_gain = 0.0f;
+        ws_h0 = Robot_Heading();
+        ws_it = 0;
+        ws_probe = 0;
+        ws_prev_step = 0.0f;
+        Wall_StartMeas();
+        break;
+    case WS_MEAS:
+        if (!still) {
+            ws = WS_IDLE;
+            break;
+        }
+        ws_fl += fl;
+        ws_fr += fr;
+        if (++ws_n >= WALL_MEAS_N) Wall_Evaluate();
+        break;
+    case WS_ZERO:
+        if (!still) ws = WS_IDLE;
+        else Wall_ZeroTick();
+        break;
+    case WS_DONE:                         // Theo dõi: tường bị xoay đi / dời xa gần / mất tường thì căn lại
+        if (!wall) {
+            ws = WS_IDLE;
+            break;
+        }
+        ws_rf += 0.02f * (r - ws_rf);     // ~0.1s
+        if (wall_gain == 0.0f || fabsf(ws_rf / wall_gain) > WALL_REALIGN_DEG
+            || fabsf(0.5f * (fl + fr) - wall_gain_ir) > 0.3f * wall_gain_ir) ws = WS_IDLE;
+        break;
+    case WS_FAIL:
+        if (!wall) ws = WS_IDLE;
+        break;
+    default:
+        break;
+    }
+}
 static void Motion_Update(void)
 {
     static uint16_t settle_ticks = 0;
+    // Tốc độ quay đã lọc cho khâu D (lọc cả lúc không chạy -> bắt đầu đoạn nào cũng đã sẵn giá trị đúng).
+    // Lọc để nhiễu rung gyro không làm vận tốc đặt 2 bánh nhảy mỗi 2ms (Ka của PID vận tốc nhân lên thành giật)
+    heading_rate_f += (CONTROL_DT / (HEADING_D_TAU_S + CONTROL_DT)) * (yaw_scale * yaw_rate_dps - heading_rate_f);
+    // Mắt trước gần tường hơn (thang IRFR) + tốc độ tăng đã lọc (/s), cho dừng trước tường
+    static float front_prev = 0.0f, front_rate = 0.0f;
+    float ir_fl = IR_FL_Filt(), ir_fr = IR_FR_Filt();
+    float front = fmaxf(ir_fl, ir_fr);
+    front_rate += (CONTROL_DT / (WALL_RATE_TAU_S + CONTROL_DT)) * ((front - front_prev) / CONTROL_DT - front_rate);
+    front_prev  = front;
     if (motion_mode == MOTION_IDLE) {
         settle_ticks = 0;
+        wall_center_e = 0.0f;
         return;
     }
 
-    // Dương: cần quay sang trái. Đi thẳng thì cộng thêm bậc thử của Heading_PID_Test (bình thường = 0)
-    float head_err = heading_target + ((motion_mode == MOTION_STRAIGHT) ? heading_step_deg : 0.0f) - Robot_Heading();
+    float head_err = heading_target - Robot_Heading();   // Dương: cần quay sang trái
     float v = 0.0f, w_dps = 0.0f;
     uint8_t arrived;
 
-    float err_stat = (motion_mode == MOTION_STRAIGHT) ? fabsf(head_err) : -motion_turn_dir * head_err;
+    if (motion_mode == MOTION_HOLD) {
+        // Bị xoay quá nửa vòng: quay về theo đường ngắn nhất. Dời đích đúng bội 360 độ (vẫn cùng hướng),
+        // giữ hướng đích liên tục cho các lệnh Turn_Angle / Move_Straight sau
+        while (head_err >  180.0f) { heading_target -= 360.0f; head_err -= 360.0f; }
+        while (head_err < -180.0f) { heading_target += 360.0f; head_err += 360.0f; }
+    }
+    float err_stat = (motion_mode == MOTION_TURN) ? -motion_turn_dir * head_err : fabsf(head_err);
     if (err_stat > motion_max_err) motion_max_err = err_stat;
-    if (fabsf(head_err) > motion_abort_deg) {             // Sai YAW_SIGN / bị va, kẹt: dừng
+    if (motion_mode != MOTION_HOLD && fabsf(head_err) > motion_abort_deg) {   // Sai YAW_SIGN / bị va, kẹt: dừng
         motion_mode   = MOTION_IDLE;
         motion_result = MOTION_ABORT;
         target_speed_left = target_speed_right = 0.0f;
         return;
     }
+    // PD giữ hướng (xem pid.h)
+    float w_pd = HEADING_KP * head_err - HEADING_KD * heading_rate_f;
     if (motion_mode == MOTION_STRAIGHT) {
         float remaining = move_target_mm - (Robot_Distance() - move_start_mm);
         arrived = fabsf(remaining) < MOVE_TOL_MM;
         if (!arrived) {
-            v = Motion_Profile(remaining, MOVE_SPEED_MMS, MOVE_DECEL_MMS2);
-            // PID giữ hướng: P theo lệch, I xóa lệch còn lại, D lấy thẳng tốc độ quay gyro
-            if (heading_ki > 0.001f)
-                heading_integral = Clamp(heading_integral + head_err * CONTROL_DT, HEADING_I_MAX_DPS / heading_ki);
-            else
-                heading_integral = 0.0f;
-            w_dps = Clamp(heading_kp * head_err + heading_ki * heading_integral - heading_kd * yaw_rate_dps,
-                          HEADING_MAX_DPS);
+            v = Motion_Profile(remaining, move_speed_mms, MOVE_DECEL_MMS2);
+            if (move_wall && v > 0.0f) {
+                // Tường trước: sắp tới WALL_TARGET_IR (tính cả đoạn trôi khi phanh) thì dừng (PID giảm tốc theo
+                // MAX_ACCEL rồi phanh), luồng chính căn tường
+                if (front + fmaxf(front_rate, 0.0f) * WALL_STOP_LEAD_S >= WALL_TARGET_IR) {
+                    motion_mode   = MOTION_IDLE;
+                    motion_result = MOTION_WALL;
+                    target_speed_left = target_speed_right = 0.0f;
+                    return;
+                }
+                v = fminf(v, Wall_SpeedLimit(front));
+                // Tường bên quá gần: cộng thêm lệch hướng ra xa (chỉ vào lệnh lái, không vào báo cáo / hủy)
+                float side = WALL_SIDE_DEG_PER_IR * (fmaxf(IR_R_Filt() - WALL_SIDE_IR, 0.0f)
+                                                   - fmaxf(IR_L_Filt() - WALL_SIDE_IR, 0.0f));
+                w_pd += HEADING_KP * Clamp(side, WALL_SIDE_MAX_DEG);
+            }
+            // Cân giữa ô theo tường bên: cũng chỉ cộng vào lệnh lái, hướng đích gyro giữ nguyên
+            if (wall_center && v > 0.0f) w_pd += HEADING_KP * Wall_CenterOffset(v, front);
+            else wall_center_e = 0.0f;
+            w_dps = Clamp(w_pd, HEADING_MAX_DPS);
         }
+    } else if (motion_mode == MOTION_HOLD) {
+        // Đứng giữ hướng + tường trước (Hold_Update). Không bao giờ xong: giữ tới lệnh chuyển động khác
+        arrived = 0;
+        Hold_Update(head_err, w_pd, ir_fl, ir_fr, front_rate, &v, &w_dps);
     } else {
         arrived = fabsf(head_err) < TURN_TOL_DEG;
         if (!arrived) w_dps = Motion_Profile(head_err, TURN_SPEED_DPS, TURN_DECEL_DPS2);
     }
 
     // Quay trái (w > 0): bánh phải nhanh hơn bánh trái. Tới đích thì đặt đúng 0 -> PID phanh hẳn
-    motion_w_corr = w_dps;
     float dv = w_dps * DEG2RAD * TRACK_WIDTH_MM * 0.5f;
     target_speed_left  = Clamp(v - dv, MAX_SPEED_MMS);
     target_speed_right = Clamp(v + dv, MAX_SPEED_MMS);
@@ -481,29 +782,53 @@ static void Motion_Update(void)
 void Motion_Begin(void)
 {
     Motor_SetSpeed(0.0f, 0.0f);
-    rezero_status = MPU6500_ZeroGyroZ();
+    MPU6500_ZeroGyroZ();                  // Bánh quay / bị chạm thì giữ offset cũ
     heading_target = Robot_Heading();
     odo_x_mm = 0.0f;
     odo_y_mm = 0.0f;
     heading_set = 1;
 }
-// Bắt đầu 1 đoạn (không chờ). 0: động cơ bị khóa / IMU chưa sẵn sàng
+// XE BỊ NHẤC (gọi trong ngắt IMU, mpu6500.c): hủy chuyển động đang chạy, tắt PID, phanh 2 bánh ngay.
+// Hàm đang chờ (Move_Straight, Turn_Angle...) trả về 0, kết quả "xe bi nhac len"
+void Motion_OnLifted(void)
+{
+    if (motion_mode != MOTION_IDLE) motion_result = MOTION_LIFTED;
+    Motor_Stop();
+}
+// XE VỪA ĐẶT XUỐNG (gọi trong ngắt IMU, yaw đã về 0): hướng + vị trí lúc đặt xuống làm gốc
+void Motion_OnPlaced(void)
+{
+    heading_target = Robot_Heading();
+    heading_set    = 1;
+    odo_x_mm       = 0.0f;
+    odo_y_mm       = 0.0f;
+}
+// Chờ tới khi xe nằm trên sàn (đặt xuống + nằm yên LIFT_PLACE_S). Xe đang trên sàn thì trả về ngay
+void Robot_WaitPlaced(void)
+{
+    while (robot_lifted) {
+    }
+}
+// Bắt đầu 1 đoạn (không chờ). 0: động cơ bị khóa / IMU chưa sẵn sàng / xe đang bị nhấc
 static uint8_t Motion_Start(MotionMode mode)
 {
     if (!motor_hw_ok || !imu_ready) {
         motion_result = MOTION_NOT_READY;
         return 0;
     }
+    if (robot_lifted) {
+        motion_result = MOTION_LIFTED;
+        return 0;
+    }
     motion_max_err   = 0.0f;
-    heading_integral = 0.0f;
-    motion_w_corr    = 0.0f;
-    heading_step_deg = 0.0f;
+    hold_active      = 0;
+    if (mode == MOTION_HOLD) Wall_Reset();
     motion_result    = MOTION_RUNNING;
     motion_mode      = mode;              // Ghi cuối cùng: các thông số đã sẵn sàng khi ngắt đọc
     return 1;
 }
-// Chờ ngắt TIM9 báo xong. hook != NULL: gọi liên tục trong lúc chờ (vd. in log), không được chặn lâu
-static uint8_t Motion_Wait(uint32_t timeout_ms, void (*hook)(void))
+// Chờ ngắt TIM9 báo xong (luồng chính)
+static uint8_t Motion_Wait(uint32_t timeout_ms)
 {
     uint32_t t0 = HAL_GetTick();
     while (motion_mode != MOTION_IDLE) {
@@ -512,27 +837,47 @@ static uint8_t Motion_Wait(uint32_t timeout_ms, void (*hook)(void))
             motion_result = MOTION_TIMEOUT;
             break;
         }
-        if (hook) hook();
     }
     if (motion_result == MOTION_ABORT) Motor_Stop();   // Lệch hướng bất thường: phanh ngay
     return motion_result == MOTION_OK;
 }
 // Chuẩn bị đoạn đi thẳng, trả về thời gian tối đa: MOTION_TIMEOUT_MS + 2 lần thời gian chạy hết đoạn
 // ở tốc độ tối đa (đoạn dài không bị cắt)
-static uint32_t Straight_Prepare(float dist_mm)
+static uint32_t Straight_Prepare(float dist_mm, float speed_mms)
 {
     if (!heading_set) Motion_Begin();
     Motor_SetSpeed(0.0f, 0.0f);           // Bật PID vận tốc (vòng ngoài sẽ đặt vận tốc)
     move_start_mm    = Robot_Distance();
     move_target_mm   = dist_mm;
+    move_speed_mms   = speed_mms;
+    move_wall        = wall_guard && dist_mm > 0.0f;   // Chỉ có mắt trước: lùi thì không xét tường
     motion_abort_deg = MOTION_ABORT_DEG;
-    return MOTION_TIMEOUT_MS + (uint32_t)(2000.0f * fabsf(dist_mm) / MOVE_SPEED_MMS);
+    return MOTION_TIMEOUT_MS + (uint32_t)(2000.0f * fabsf(dist_mm) / speed_mms);
 }
-uint8_t Move_Straight(float dist_mm)
+uint8_t Move_Straight(float dist_mm, float speed_mms)
 {
-    uint32_t timeout_ms = Straight_Prepare(dist_mm);
+    speed_mms = fabsf(speed_mms);
+    if (speed_mms > MAX_SPEED_MMS) speed_mms = MAX_SPEED_MMS;
+    if (speed_mms < 1.0f || fabsf(dist_mm) < MOVE_TOL_MM) {
+        // Tốc độ 0 hoặc quãng đường 0: ĐỨNG GIỮ HƯỚNG + tường trước (lùi khi IR > WALL_STOP_IR, tự căn vuông góc,
+        // đặt lại MPU), chạy nền trong ngắt, không chờ. Đang giữ rồi thì để yên -> gọi lặp trong while(1) được
+        if (motion_mode == MOTION_HOLD) return 1;
+        if (!heading_set) Motion_Begin();
+        Motor_SetSpeed(0.0f, 0.0f);
+        return Motion_Start(MOTION_HOLD);
+    }
+    uint32_t timeout_ms = Straight_Prepare(dist_mm, speed_mms);
     if (!Motion_Start(MOTION_STRAIGHT)) return 0;
-    return Motion_Wait(timeout_ms, NULL);
+    uint8_t ok = Motion_Wait(timeout_ms);
+    // Bị tường trước chặn giữa đường, hoặc đi đủ quãng đường mà trước mặt có tường (cả 2 mắt >= WALL_PRESENT_IR):
+    // tiến / lùi tới WALL_TARGET_IR, căn vuông góc, đặt lại hướng MPU
+    uint8_t wall_ahead = ok && move_wall && fminf(IR_FL_Filt(), IR_FR_Filt()) >= WALL_PRESENT_IR;
+    if (motion_result != MOTION_WALL && !wall_ahead) return ok;
+    // Giữ |lệch hướng| lớn nhất của đoạn đi thẳng cho báo cáo
+    float max_err = motion_max_err;
+    ok = Wall_Align();
+    motion_max_err = max_err;
+    return ok ? 2 : 0;
 }
 uint8_t Turn_Angle(float deg)
 {
@@ -542,10 +887,75 @@ uint8_t Turn_Angle(float deg)
     motion_turn_dir  = (deg >= 0.0f) ? 1.0f : -1.0f;
     motion_abort_deg = fabsf(deg) + MOTION_ABORT_DEG;   // Quay ngược chiều quá MOTION_ABORT_DEG -> sai dấu gyro
     if (!Motion_Start(MOTION_TURN)) return 0;
-    return Motion_Wait(MOTION_TIMEOUT_MS + (uint32_t)(2000.0f * fabsf(deg) / TURN_SPEED_DPS), NULL);
+    return Motion_Wait(MOTION_TIMEOUT_MS + (uint32_t)(2000.0f * fabsf(deg) / TURN_SPEED_DPS));
 }
 uint8_t Turn_Left(float deg)  { return Turn_Angle(deg); }
 uint8_t Turn_Right(float deg) { return Turn_Angle(-deg); }
+
+// ===== ĐI THẲNG KHÔNG CHỜ (solving_maze.c: chạy liên tục nhiều ô, kéo dài / rút ngắn đoạn đang chạy) =====
+// Cùng chế độ MOTION_STRAIGHT với Move_Straight (PD giữ hướng gyro, hãm theo quãng còn lại, dừng trước tường, tránh
+// tường bên) nhưng trả về ngay. Luồng chính đọc quãng đã đi, đổi đích bất cứ lúc nào: ngắt TIM9 tính lại vận tốc theo
+// quãng còn lại mỗi 2ms -> kéo dài thì xe chạy tiếp không giảm tốc, rút ngắn thì xe hãm vừa kịp dừng ở đích mới.
+// Không tự căn tường khi xong (Move_Straight có), không giới hạn thời gian (người gọi tự kiểm tra)
+uint8_t Move_Straight_Begin(float dist_mm, float speed_mms)
+{
+    speed_mms = fabsf(speed_mms);
+    if (speed_mms > MAX_SPEED_MMS) speed_mms = MAX_SPEED_MMS;
+    if (speed_mms < 1.0f) return 0;
+    (void)Straight_Prepare(dist_mm, speed_mms);
+    return Motion_Start(MOTION_STRAIGHT);
+}
+// Đổi quãng đường đích (tính từ lúc Move_Straight_Begin) khi đang chạy. Ghi 1 float 32-bit: nguyên tử với ngắt
+void Move_Straight_SetTarget(float dist_mm)
+{
+    move_target_mm = dist_mm;
+}
+// Quãng đường tâm xe đã đi từ lúc Move_Straight_Begin (mm). Tắt ngắt để 2 bánh cùng 1 chu kỳ
+float Move_Straight_Traveled(void)
+{
+    __disable_irq();
+    float d = Robot_Distance() - move_start_mm;
+    __enable_irq();
+    return d;
+}
+// Trạng thái đoạn chuyển động gần nhất (MOTION_STATUS_*, pid.h)
+uint8_t Motion_Status(void)
+{
+    if (motion_mode != MOTION_IDLE) return MOTION_STATUS_RUNNING;
+    switch (motion_result) {
+    case MOTION_OK:   return MOTION_STATUS_DONE;
+    case MOTION_WALL: return MOTION_STATUS_WALL;
+    default:          return MOTION_STATUS_FAIL;
+    }
+}
+
+// ===== TỰ CĂN THEO TƯỜNG TRƯỚC, CHỜ XONG (Wall_Align, xem pid.h) =====
+// Dùng đúng chế độ đứng giữ hướng (MOTION_HOLD, căn tường chạy trong ngắt - Hold_Update), chờ tới khi căn xong
+// (WS_DONE) / không căn được (WS_FAIL), rồi thôi giữ, phanh đứng yên như các lệnh chặn khác
+uint8_t Wall_Align(void)
+{
+    if (!heading_set) Motion_Begin();
+    float h_ref = heading_target;                 // Hướng xe được lệnh đi = hướng sẽ gán cho pháp tuyến tường
+    Motor_SetSpeed(0.0f, 0.0f);
+    ws_force = 1;                                 // Không thấy tường -> WS_FAIL ngay (không chờ mãi)
+    if (!Motion_Start(MOTION_HOLD)) {
+        ws_force = 0;
+        return 0;
+    }
+    uint32_t t0 = HAL_GetTick();
+    while (motion_mode == MOTION_HOLD && ws != WS_DONE && ws != WS_FAIL && HAL_GetTick() - t0 < WALL_ALIGN_TIMEOUT_MS) {
+    }
+    uint8_t ok = (motion_mode == MOTION_HOLD && ws == WS_DONE);
+    ws_force = 0;
+    Motor_SetSpeed(0.0f, 0.0f);
+    if (!ok) {
+        if (motion_result != MOTION_LIFTED && motion_result != MOTION_NOT_READY) motion_result = MOTION_WALL_FAIL;
+        heading_target = h_ref;                   // Lệnh sau vẫn tính theo hướng cũ
+        return 0;
+    }
+    motion_result = MOTION_WALL;
+    return 1;
+}
 
 // ===== TEST / DEBUG =====
 // In dữ liệu PID để chỉnh hệ số (vẽ bằng Serial Plotter): vận tốc đặt (sau ramp), đo, PWM của trái rồi phải
@@ -676,7 +1086,10 @@ typedef struct {
 } MotionSeg;
 // Chuỗi in ra cho từng MotionResult
 static const char *const motion_result_str[] = { "OK", "dang chay", "HUY: lech huong (sai YAW_SIGN? bi va?)",
-                                                 "HUY: qua thoi gian (ket banh?)", "HUY: chua san sang" };
+                                                 "HUY: qua thoi gian (ket banh?)", "HUY: chua san sang",
+                                                 "HUY: xe bi nhac len",
+                                                 "DUNG TRUOC TUONG: da can vuong goc, dat lai huong MPU",
+                                                 "HUY: dung truoc tuong nhung khong can vuong goc duoc" };
 void Rectangle_Test(float length_mm, float width_mm)
 {
     MotionSeg seg[8];
@@ -702,7 +1115,7 @@ void Rectangle_Test(float length_mm, float width_mm)
         s->turn = k & 1;
         if (!s->turn) {
             s->target = (k % 4 == 0) ? length_mm : width_mm;
-            ok = Move_Straight(s->target);
+            ok = Move_Straight(s->target, MOVE_SPEED_MMS);
         } else {
             s->target = -90.0f;
             ok = Turn_Right(90.0f);
@@ -744,7 +1157,7 @@ void Rectangle_Test(float length_mm, float width_mm)
 // ĐI THẲNG dist_mm (âm = lùi) rồi in báo cáo. Quãng đường đo bằng encoder, hướng giữ bằng gyro MPU6500.
 // Đặt xe trên sàn, bấm reset rồi rút tay: xe đứng yên 1s (IMU chỉnh offset) mới chạy.
 // Chạy xong đứng phanh, CHỜ máy tính mở cổng COM rồi in báo cáo (giống PID_Test).
-void Straight_Test(float dist_mm)
+void Straight_Test(float dist_mm, float speed_mms)
 {
     if (!motor_hw_ok || !imu_ready) {
         CDC_WaitHost();
@@ -759,7 +1172,7 @@ void Straight_Test(float dist_mm)
     float h0 = heading_target * DEG2RAD;
     float l0 = dist_left_mm, r0 = dist_right_mm;
     uint32_t t0 = HAL_GetTick();
-    Move_Straight(dist_mm);
+    Move_Straight(dist_mm, speed_mms);
     uint32_t ms = HAL_GetTick() - t0;
 
     // 2. Kết quả (đọc ngay, trước khi chờ máy tính). Vị trí đổi về trục của xe lúc xuất phát
@@ -774,7 +1187,7 @@ void Straight_Test(float dist_mm)
     CDC_WaitHost();
     CDC_Print("\r\n================ TEST DI THANG ================\r\n");
     snprintf(msg, sizeof(msg), "Dich %+.1f mm | toc do toi da %.0f mm/s, giam toc %.0f mm/s2 | sai so cho phep %.1f mm\r\n",
-             dist_mm, MOVE_SPEED_MMS, MOVE_DECEL_MMS2, MOVE_TOL_MM);
+             dist_mm, speed_mms, MOVE_DECEL_MMS2, MOVE_TOL_MM);
     CDC_Print(msg);
     snprintf(msg, sizeof(msg), "Ket qua: %s | thoi gian %lu ms (TB %.0f mm/s)\r\n", motion_result_str[result],
              (unsigned long)ms, (ms > 0) ? fabsf(0.5f * (dl + dr)) * 1000.0f / ms : 0.0f);
@@ -795,535 +1208,149 @@ void Straight_Test(float dist_mm)
     CDC_Print("================ HET TEST ================\r\n");
 }
 
-// ===== ĐI THẲNG + IN LOG QUA UART (HC-05) =====
-// Luồng chính in, ngắt TIM9 vẫn điều khiển xe -> in chậm (UART chờ) cũng không ảnh hưởng chuyển động
-static TickStat TickStat_Get(void);
-static void TickStat_Print(const char *name, const TickStat *s);
-static struct {
-    uint32_t t0, t_prev, next;
-    float    s0, yaw0, enc0;              // Giá trị lúc bắt đầu
-    float    yaw_prev, enc_prev;          // Dòng trước, để tính tốc độ quay trung bình giữa 2 dòng
-    float    sum_dw, sum_dw2;             // Thống kê (w_gyro - w_enc) lúc xe đang chạy
-    uint32_t n_dw;
-} ulog;
-// In 1 dòng: tốc độ quay gyro và encoder tính trên CÙNG khoảng thời gian giữa 2 dòng (so sánh công bằng;
-// tốc độ quay encoder tức thời rất nhiễu vì 1 xung / 2ms đã là ~67 mm/s)
-static void Log_UART_Line(void)
+// ===== TỰ HIỆU CHỈNH ĐỘ NHẠY GYRO BẰNG CÁCH QUAY (Gyro_Spin_Calibrate) =====
+// Tín hiệu IR (làm mịn 5 mẫu ~7 độ), nhân pol để đỉnh tường luôn là cực ĐẠI (mạch có thể cho giá trị giảm khi gần)
+static float Spin_Signal(uint32_t i, uint32_t n, float pol)
 {
-    uint32_t now = HAL_GetTick();
-    float yaw = Robot_Heading()  - ulog.yaw0;
-    float enc = enc_heading_deg  - ulog.enc0;
-    float dt  = (now - ulog.t_prev) / 1000.0f;
-    float w_gyro = (dt > 0.0f) ? (yaw - ulog.yaw_prev) / dt : 0.0f;
-    float w_enc  = (dt > 0.0f) ? (enc - ulog.enc_prev) / dt : 0.0f;
-    ulog.t_prev   = now;
-    ulog.yaw_prev = yaw;
-    ulog.enc_prev = enc;
-    if (fabsf(speed_left_mms) + fabsf(speed_right_mms) > 2.0f * MOTION_STOP_MMS) {
-        float dw = w_gyro - w_enc;
-        ulog.sum_dw  += dw;
-        ulog.sum_dw2 += dw * dw;
-        ulog.n_dw++;
-    }
-    snprintf(msg, sizeof(msg), "LOG,%lu,%.1f,%.0f,%.0f,%+.2f,%+.2f,%+.1f,%+.1f,%+.2f,%+.1f\r\n",
-             (unsigned long)(now - ulog.t0), Robot_Distance() - ulog.s0, speed_left_mms, speed_right_mms,
-             yaw, enc, w_gyro, w_enc, heading_target - Robot_Heading(), motion_w_corr);
-    UART_Print(msg);
+    uint32_t a = (i >= 2) ? i - 2 : 0, b = (i + 2 < n) ? i + 2 : n - 1;
+    float s = 0.0f;
+    for (uint32_t j = a; j <= b; j++) s += spin_rec[j].ir;
+    return pol * s / (float)(b - a + 1);
 }
-// Gọi liên tục trong lúc chờ xe chạy: đến hạn thì in 1 dòng (in chậm hơn chu kỳ thì bỏ qua, không dồn)
-static void Log_UART_Hook(void)
+// Tìm đỉnh tường trong cửa sổ hướng [lo, hi). Vị trí đỉnh = trọng tâm phần tín hiệu trên 70% (chính xác hơn
+// lấy 1 mẫu lớn nhất). Trả 1 nếu có đỉnh rõ, nằm trọn trong cửa sổ; h, dd = hướng gyro, chênh quãng 2 bánh tại đỉnh
+static uint8_t Spin_FindPeak(uint32_t n, float lo, float hi, float pol, float *h, float *dd, float *contrast)
 {
-    uint32_t now = HAL_GetTick();
-    if ((int32_t)(now - ulog.next) < 0) return;
-    ulog.next += LOG_UART_PERIOD_MS;
-    if ((int32_t)(now - ulog.next) >= 0) ulog.next = now + LOG_UART_PERIOD_MS;
-    Log_UART_Line();
-}
-// ĐI THẲNG dist_mm, giữ hướng bằng PID gyro, VỪA CHẠY VỪA IN qua USART1 (HC-05).
-// Chờ nhận 1 ký tự bất kỳ qua UART (gửi từ app Bluetooth) rồi đứng yên 1s (IMU chỉnh offset) mới chạy.
-// Mỗi dòng LOG (CSV, vẽ được bằng Excel / Serial Plotter):
-//   t_ms, s_mm (quãng đường tâm xe), vT/vP (vận tốc bánh trái/phải mm/s),
-//   yaw_gyro / yaw_enc (góc quay theo gyro / theo encoder, độ),
-//   w_gyro / w_enc (tốc độ quay theo gyro / theo encoder, độ/s), lech_huong (độ), w_pid (độ/s PID sửa hướng)
-void Straight_Log_UART(float dist_mm)
-{
-    if (!motor_hw_ok || !imu_ready) {
-        UART_Print("\r\nLOI: dong co bi khoa (CubeMX) hoac IMU chua san sang (MPU6500_Setup) - khong chay duoc\r\n");
-        HAL_Delay(1000);
-        return;
-    }
-    snprintf(msg, sizeof(msg), "\r\nSan sang di thang %.0f mm. Gui 1 ky tu bat ky de chay...\r\n", dist_mm);
-    UART_WaitStart(msg);
-
-    // 1. Đứng yên 1s (kịp bỏ tay ra, IMU chỉnh offset), lấy gốc
-    Motor_SetSpeed(0.0f, 0.0f);
-    HAL_Delay(1000);
-    Motion_Begin();
-    uint32_t timeout_ms = Straight_Prepare(dist_mm);
-    float l0 = dist_left_mm, r0 = dist_right_mm;
-    ulog.t0 = ulog.t_prev = ulog.next = HAL_GetTick();
-    ulog.s0 = Robot_Distance();
-    ulog.yaw0 = Robot_Heading();
-    ulog.enc0 = enc_heading_deg;
-    ulog.yaw_prev = ulog.enc_prev = 0.0f;
-    ulog.sum_dw = ulog.sum_dw2 = 0.0f;
-    ulog.n_dw = 0;
-
-    UART_Print("================ DI THANG + LOG GYRO / ENCODER ================\r\n");
-    snprintf(msg, sizeof(msg), "Dich %.0f mm, toi da %.0f mm/s | PID huong Kp=%.1f Ki=%.1f Kd=%.2f | TRACK_WIDTH %.1f mm\r\n",
-             dist_mm, MOVE_SPEED_MMS, HEADING_KP, HEADING_KI, HEADING_KD, TRACK_WIDTH_MM);
-    UART_Print(msg);
-    UART_Print("LOG,t_ms,s_mm,vT_mms,vP_mms,yaw_gyro,yaw_enc,w_gyro,w_enc,lech_huong,w_pid\r\n");
-
-    // 2. Chạy, trong lúc chờ thì in log
-    TickStat_Reset();
-    if (Motion_Start(MOTION_STRAIGHT)) Motion_Wait(timeout_ms, Log_UART_Hook);
-    TickStat tick_move = TickStat_Get();
-    Log_UART_Line();                      // Dòng cuối: lúc đã dừng
-
-    // 3. Tổng kết
-    float dl = dist_left_mm - l0, dr = dist_right_mm - r0, dc = 0.5f * (dl + dr);
-    float yaw = Robot_Heading() - ulog.yaw0, enc = enc_heading_deg - ulog.enc0;
-    float mean = (ulog.n_dw > 0) ? ulog.sum_dw / ulog.n_dw : 0.0f;
-    float var  = (ulog.n_dw > 0) ? ulog.sum_dw2 / ulog.n_dw - mean * mean : 0.0f;
-    UART_Print("---------------- TONG KET ----------------\r\n");
-    snprintf(msg, sizeof(msg), "Ket qua: %s | %lu ms | quang duong tam %+.1f mm (trai %+.1f, phai %+.1f)\r\n",
-             motion_result_str[motion_result], (unsigned long)(HAL_GetTick() - ulog.t0), dc, dl, dr);
-    UART_Print(msg);
-    snprintf(msg, sizeof(msg), "Goc quay: gyro %+.2f do | encoder %+.2f do | chenh %+.2f do\r\n", yaw, enc, enc - yaw);
-    UART_Print(msg);
-    snprintf(msg, sizeof(msg), "Toc do quay (encoder - gyro) luc chay: TB %+.2f do/s, lech chuan %.2f do/s (%lu mau)\r\n",
-             -mean, (var > 0.0f) ? sqrtf(var) : 0.0f, (unsigned long)ulog.n_dw);
-    UART_Print(msg);
-    snprintf(msg, sizeof(msg), "Lech huong: lon nhat %.2f do, luc dung %+.2f do\r\n",
-             motion_max_err, heading_target - Robot_Heading());
-    UART_Print(msg);
-    TickStat_Print("luc chay + in UART", &tick_move);
-    // Gyro giữ xe thẳng mà encoder báo đã quay = 2 bánh đi được quãng đường khác nhau
-    if (fabsf(dc) > 1.0f) {
-        snprintf(msg, sizeof(msg), "Banh phai di nhieu hon banh trai %+.1f mm (%+.2f%%)%s\r\n", dr - dl,
-                 (dr - dl) * 100.0f / fabsf(dc),
-                 (fabsf(dr - dl) > 0.005f * fabsf(dc)) ? " -> duong kinh 2 banh khac nhau hoac 1 banh truot" : " -> 2 banh deu");
-        UART_Print(msg);
-        // Phần encoder quay mà gyro không quay = chênh quãng đường do lệch đường kính. Chia đều cho 2 bánh
-        // (giữ trung bình): encoder báo quay trái nhiều hơn thật -> bánh phải khai báo to hơn thật -> giảm phải, tăng trái
-        float k = 0.5f * (enc - yaw) * DEG2RAD * TRACK_WIDTH_MM / dc;
-        snprintf(msg, sizeof(msg), "De xuat (tin gyro, nen lay TB vai lan): WHEEL_DIAMETER_L = %.2f, WHEEL_DIAMETER_R = %.2f\r\n",
-                 WHEEL_DIAMETER_L * (1.0f + k), WHEEL_DIAMETER_R * (1.0f - k));
-        UART_Print(msg);
-        snprintf(msg, sizeof(msg), "Quang duong: do bang thuoc roi nhan CA 2 duong kinh voi (quang duong that / %.1f)\r\n", fabsf(dc));
-        UART_Print(msg);
-    }
-    UART_Print("================ HET ================\r\n");
-}
-
-// ===== ĐI THẲNG + GHI DỮ LIỆU RUNG MPU VÀO RAM (Straight_IMU_Test) =====
-static TickStat TickStat_Get(void)        // Chụp số đo ngắt TIM9 hiện tại
-{
-    TickStat s;
-    s.n = tick_stat.n;
-    s.period_min = tick_stat.period_min;
-    s.period_max = tick_stat.period_max;
-    s.exec_max = tick_stat.exec_max;
-    return s;
-}
-static void TickStat_Print(const char *name, const TickStat *s)
-{
-    float cyc_per_us = SystemCoreClock / 1000000.0f;
-    snprintf(msg, sizeof(msg), "Ngat TIM9 %s: %lu lan, chu ky %.1f..%.1f us (chuan 2000), xu ly lau nhat %.1f us (%.1f%% CPU)\r\n",
-             name, (unsigned long)s->n, s->period_min / cyc_per_us, s->period_max / cyc_per_us,
-             s->exec_max / cyc_per_us, s->exec_max / cyc_per_us / 20.0f);
-    UART_Print(msg);
-}
-// Kênh ch của 1 mẫu: 0..2 gyro x y z, 3..5 accel x y z (số thô)
-static float Rec_Val(const ImuRec *r, int ch)
-{
-    return (ch < 3) ? r->g[ch] : r->a[ch - 3];
-}
-// Thống kê các mẫu [i0, i1): trung bình + độ lệch chuẩn từng kênh (số thô, tính 2 lượt cho chính xác)
-typedef struct {
-    uint32_t n, fresh;
-    float mean[6], std[6];
-    int32_t enc_abs;                      // Tổng |xung| 2 bánh: đứng yên phải = 0
-    float v_mms;                          // Vận tốc tâm xe trung bình
-} RecStat;
-static void Rec_Stats(uint32_t i0, uint32_t i1, RecStat *s)
-{
-    memset(s, 0, sizeof(*s));
-    if (i1 <= i0) return;
-    s->n = i1 - i0;
-    float dist = 0.0f;
-    for (uint32_t i = i0; i < i1; i++) {
-        const ImuRec *r = &rec_buf.imu[i];
-        for (int c = 0; c < 6; c++) s->mean[c] += Rec_Val(r, c);
-        s->fresh   += r->fresh;
-        s->enc_abs += abs(r->enc_l) + abs(r->enc_r);
-        dist += 0.5f * (ENC_L_SIGN * r->enc_l * MM_PER_COUNT_L + ENC_R_SIGN * r->enc_r * MM_PER_COUNT_R);
-    }
-    for (int c = 0; c < 6; c++) s->mean[c] /= s->n;
-    for (uint32_t i = i0; i < i1; i++) {
-        for (int c = 0; c < 6; c++) {
-            float d = Rec_Val(&rec_buf.imu[i], c) - s->mean[c];
-            s->std[c] += d * d;
-        }
-    }
-    for (int c = 0; c < 6; c++) s->std[c] = sqrtf(s->std[c] / s->n);
-    s->v_mms = dist / (s->n * CONTROL_DT);
-}
-static void Rec_PrintRow(const char *name, const RecStat *s)
-{
-    const float G = 1.0f / 16.4f, A = 1000.0f / 16384.0f;   // Số thô -> độ/s, mg
-    snprintf(msg, sizeof(msg), "%-16s %4lu %4lu %+7.3f %6.3f %6.3f %6.3f %6.2f %6.2f %6.2f %5ld %6.0f\r\n",
-             name, (unsigned long)s->n, (unsigned long)s->fresh,
-             (s->mean[2] - gyro_z_offset) * G, s->std[2] * G, s->std[0] * G, s->std[1] * G,
-             s->std[3] * A, s->std[4] * A, s->std[5] * A, (long)s->enc_abs, s->v_mms);
-    UART_Print(msg);
-}
-// Biên độ thành phần tần số f_hz của kênh ch trong [i0, i1) (thuật toán Goertzel, lấy mẫu 500Hz)
-static float Rec_Goertzel(uint32_t i0, uint32_t i1, int ch, float mean, float f_hz)
-{
-    float coeff = 2.0f * cosf(2.0f * 3.14159265f * f_hz * CONTROL_DT);
-    float s1 = 0.0f, s2 = 0.0f;
-    for (uint32_t i = i0; i < i1; i++) {
-        float s = Rec_Val(&rec_buf.imu[i], ch) - mean + coeff * s1 - s2;
-        s2 = s1;
-        s1 = s;
-    }
-    float power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
-    return (power > 0.0f) ? 2.0f * sqrtf(power) / (i1 - i0) : 0.0f;
-}
-// Quét 0.5..100Hz (bước 0.25Hz), in 3 đỉnh lớn nhất của kênh ch. scale: số thô -> đơn vị in
-static void Rec_PrintPeaks(uint32_t i0, uint32_t i1, int ch, float mean, float scale, const char *name)
-{
-    float pf[3] = { 0, 0, 0 }, pa[3] = { 0, 0, 0 };
-    float a_prev2 = 0.0f, a_prev = 0.0f;
-    for (int k = 2; k <= 401; k++) {
-        float a = Rec_Goertzel(i0, i1, ch, mean, k * 0.25f) * scale;
-        if (k >= 4 && a_prev > a_prev2 && a_prev >= a) {          // Đỉnh tại k-1
-            float f = (k - 1) * 0.25f;
-            for (int j = 0; j < 3; j++) {                         // Chèn vào top 3 theo biên độ
-                if (a_prev > pa[j]) {
-                    for (int m = 2; m > j; m--) { pa[m] = pa[m - 1]; pf[m] = pf[m - 1]; }
-                    pa[j] = a_prev;
-                    pf[j] = f;
-                    break;
-                }
-            }
-        }
-        a_prev2 = a_prev;
-        a_prev = a;
-    }
-    snprintf(msg, sizeof(msg), "  %-14s %6.2f Hz (%.3f) | %6.2f Hz (%.3f) | %6.2f Hz (%.3f)\r\n",
-             name, pf[0], pa[0], pf[1], pa[1], pf[2], pa[2]);
-    UART_Print(msg);
-}
-// Chờ tới khi ngắt ghi đủ n mẫu (hoặc đầy bộ nhớ). Có giới hạn thời gian: ngắt TIM9 không chạy thì không treo
-static void Rec_WaitCount(uint32_t n)
-{
-    if (n > IMU_REC_MAX) n = IMU_REC_MAX;
-    uint32_t t0 = HAL_GetTick();
-    uint32_t limit_ms = (n > imu_rec_n) ? (n - imu_rec_n) * 2U + 1000U : 0U;
-    while (imu_rec_n < n && HAL_GetTick() - t0 < limit_ms) {}
-}
-void Straight_IMU_Test(float dist_mm, uint8_t dump_raw)
-{
-    static const char *phase_name[REC_PHASES] = { "1.DungYen", "2.DungYen+UART", "3.Chay", "4.SauKhiDung" };
-    if (!motor_hw_ok || !imu_ready) {
-        UART_Print("\r\nLOI: dong co bi khoa (CubeMX) hoac IMU chua san sang (MPU6500_Setup) - khong chay duoc\r\n");
-        HAL_Delay(1000);
-        return;
-    }
-    snprintf(msg, sizeof(msg), "\r\nTest rung MPU: di thang %.0f mm. Gui 1 ky tu bat ky de chay...\r\n", dist_mm);
-    UART_WaitStart(msg);
-
-    // 1. Đứng yên 1s (bỏ tay ra, IMU chỉnh offset), lấy gốc
-    Motor_SetSpeed(0.0f, 0.0f);
-    HAL_Delay(1000);
-    Motion_Begin();
-    uint32_t err0 = MPU6500_ErrorCount(), cnt0 = imu_sample_count;
-
-    // 2. Ghi 0.5s đứng yên IM LẶNG (không gửi gì) -> mức nhiễu nền
-    TickStat_Reset();
-    imu_rec_last_count = imu_sample_count;
-    imu_rec_phase = REC_STILL;
-    imu_rec_n = 0;
-    Rec_WaitCount(IMU_REC_STILL);
-    TickStat tick_still = TickStat_Get();
-
-    // 3. Ghi 0.5s đứng yên, GỬI UART LIÊN TỤC -> UART/Bluetooth có làm nhiễu encoder, IMU, ngắt không
-    TickStat_Reset();
-    imu_rec_phase = REC_UART;
-    uint32_t t_uart = HAL_GetTick();
-    while (imu_rec_n < 2 * IMU_REC_STILL && HAL_GetTick() - t_uart < 3000U)
-        UART_Print("NHIEU_UART,UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU\r\n");
-    TickStat tick_uart = TickStat_Get();
-
-    // 4. Chạy thẳng, KHÔNG gửi gì trong lúc chạy
-    uint32_t timeout_ms = Straight_Prepare(dist_mm);
-    float l0 = dist_left_mm, r0 = dist_right_mm;
-    TickStat_Reset();
-    imu_rec_phase = REC_MOVE;
-    if (Motion_Start(MOTION_STRAIGHT)) Motion_Wait(timeout_ms, NULL);
-    TickStat tick_move = TickStat_Get();
-    MotionResult result = motion_result;
-
-    // 5. Thêm 0.3s sau khi dừng rồi ngừng ghi
-    imu_rec_phase = REC_AFTER;
-    Rec_WaitCount((uint32_t)imu_rec_n + 150);
-    uint32_t n = imu_rec_n;
-    imu_rec_n = IMU_REC_MAX;              // Ngừng ghi
-    float dl = dist_left_mm - l0, dr = dist_right_mm - r0;
-    uint32_t imu_got = imu_sample_count - cnt0, err = MPU6500_ErrorCount() - err0;
-
-    // 6. Tách giai đoạn (các giai đoạn ghi nối tiếp nhau)
-    uint32_t p0[REC_PHASES], p1[REC_PHASES];
-    for (int p = 0; p < REC_PHASES; p++) { p0[p] = n; p1[p] = 0; }
+    uint32_t i0 = n, i1 = 0, i_max = n;
+    float s_max = -1e9f, s_min = 1e9f;
     for (uint32_t i = 0; i < n; i++) {
-        int p = rec_buf.imu[i].phase;
-        if (i < p0[p]) p0[p] = i;
-        if (i + 1 > p1[p]) p1[p] = i + 1;
+        if (spin_rec[i].h < lo || spin_rec[i].h >= hi) continue;
+        if (i < i0) i0 = i;
+        i1 = i + 1;
+        float s = Spin_Signal(i, n, pol);
+        if (s > s_max) { s_max = s; i_max = i; }
+        if (s < s_min) s_min = s;
     }
-    for (int p = 0; p < REC_PHASES; p++) if (p1[p] < p0[p]) p0[p] = p1[p];
-    // Chạy đều = 60% giữa đoạn chạy (bỏ lúc tăng tốc / giảm tốc)
-    uint32_t mlen = p1[REC_MOVE] - p0[REC_MOVE];
-    uint32_t c0 = p0[REC_MOVE] + mlen / 5, c1 = p1[REC_MOVE] - mlen / 5;
-    RecStat st[REC_PHASES], cruise;
-    for (int p = 0; p < REC_PHASES; p++) Rec_Stats(p0[p], p1[p], &st[p]);
-    Rec_Stats(c0, c1, &cruise);
-
-    // 7. Báo cáo
-    UART_Print("\r\n================ TEST RUNG MPU KHI DI THANG ================\r\n");
-    snprintf(msg, sizeof(msg), "Dich %.0f mm | ghi %lu mau x 2ms%s | PID huong Kp=%.1f Ki=%.1f Kd=%.2f | DLPF gyro %d accel %d\r\n",
-             dist_mm, (unsigned long)n, (n >= IMU_REC_MAX) ? " (DAY BO NHO)" : "",
-             HEADING_KP, HEADING_KI, HEADING_KD, GYRO_DLPF_CFG, ACCEL_DLPF_CFG);
-    UART_Print(msg);
-    snprintf(msg, sizeof(msg), "Ket qua: %s | quang duong tam %+.1f mm (trai %+.1f, phai %+.1f) | huong lech luc dung %+.2f do\r\n",
-             motion_result_str[result], 0.5f * (dl + dr), dl, dr, heading_target - Robot_Heading());
-    UART_Print(msg);
-    UART_Print("Giai doan         Mau IMUmoi  GzTB     Gz     Gx     Gy     Ax     Ay     Az  Xung V(mm/s)\r\n");
-    Rec_PrintRow(phase_name[REC_STILL], &st[REC_STILL]);
-    Rec_PrintRow(phase_name[REC_UART],  &st[REC_UART]);
-    Rec_PrintRow(phase_name[REC_MOVE],  &st[REC_MOVE]);
-    Rec_PrintRow("3b.Chay deu", &cruise);
-    Rec_PrintRow(phase_name[REC_AFTER], &st[REC_AFTER]);
-    UART_Print("Don vi: GzTB = Gz TB tru offset (do/s) | Gz Gx Gy = do lech chuan (do/s) | Ax Ay Az = do lech chuan (mg)\r\n");
-    UART_Print("        IMUmoi = so mau IMU moi / so lan ghi | Xung = tong |xung| encoder 2 banh (dung yen phai = 0)\r\n");
-    UART_Print("        3b = 60% giua doan chay (bo tang/giam toc). Cot giai_doan trong RAW: 1..4 nhu tren\r\n");
-
-    // Nhận xét
-    const RecStat *q = &st[REC_STILL];
-    float gz0 = (q->std[2] > 0.0f) ? q->std[2] : 1.0f, az0 = (q->std[5] > 0.0f) ? q->std[5] : 1.0f;
-    float gx0 = (q->std[0] > 0.0f) ? q->std[0] : 1.0f, gy0 = (q->std[1] > 0.0f) ? q->std[1] : 1.0f;
-    UART_Print("---------------- NHAN XET ----------------\r\n");
-    snprintf(msg, sizeof(msg), "UART/Bluetooth -> encoder: %ld xung khi dung yen luc gui UART %s\r\n", (long)st[REC_UART].enc_abs,
-             (st[REC_UART].enc_abs == 0) ? "-> OK, khong nhieu" : "-> NHIEU LOT VAO ENCODER: bat Input Filter TIM2/TIM3 trong CubeMX");
-    UART_Print(msg);
-    snprintf(msg, sizeof(msg), "UART/Bluetooth -> IMU: nhieu Gz x%.2f, Az x%.2f so voi dung yen im lang (~1.0 = khong anh huong)\r\n",
-             st[REC_UART].std[2] / gz0, st[REC_UART].std[5] / az0);
-    UART_Print(msg);
-    snprintf(msg, sizeof(msg), "Rung khi chay deu (dong co + banh): Gz x%.1f, Gx x%.1f, Gy x%.1f, Az x%.1f so voi dung yen\r\n",
-             cruise.std[2] / gz0, cruise.std[0] / gx0, cruise.std[1] / gy0, cruise.std[5] / az0);
-    UART_Print(msg);
-    uint32_t fresh = 0;
-    for (int p = 0; p < REC_PHASES; p++) fresh += st[p].fresh;
-    snprintf(msg, sizeof(msg), "Mau IMU moi: %lu / %lu lan ghi (2ms/lan) | IMU xu ly %lu mau | loi I2C them %lu\r\n",
-             (unsigned long)fresh, (unsigned long)n, (unsigned long)imu_got, (unsigned long)err);
-    UART_Print(msg);
-    TickStat_Print("dung yen     ", &tick_still);
-    TickStat_Print("luc gui UART ", &tick_uart);
-    TickStat_Print("luc xe chay  ", &tick_move);
-    UART_Print("(Chu ky lech <~20 us va xu ly << 2000 us = in UART KHONG lam tre / sai vong dieu khien)\r\n");
-
-    // Tần số rung lúc chạy đều
-    if (c1 > c0 + 100) {
-        float f_wheel = cruise.v_mms / (3.14159265f * WHEEL_DIAMETER);
-        snprintf(msg, sizeof(msg), "---------------- TAN SO RUNG (chay deu, %lu mau, phan giai %.2f Hz) ----------------\r\n",
-                 (unsigned long)(c1 - c0), 1.0f / ((c1 - c0) * CONTROL_DT));
-        UART_Print(msg);
-        snprintf(msg, sizeof(msg), "Du kien: 1 vong banh = %.2f Hz (2 lan = %.2f Hz) | dong co = %.2f Hz x ti so hop so\r\n",
-                 f_wheel, 2.0f * f_wheel, f_wheel);
-        UART_Print(msg);
-        UART_Print("  Kenh           3 dinh lon nhat: tan so (bien do)\r\n");
-        Rec_PrintPeaks(c0, c1, 2, cruise.mean[2], 1.0f / 16.4f, "Gz (do/s)");
-        Rec_PrintPeaks(c0, c1, 0, cruise.mean[0], 1.0f / 16.4f, "Gx (do/s)");
-        Rec_PrintPeaks(c0, c1, 1, cruise.mean[1], 1.0f / 16.4f, "Gy (do/s)");
-        Rec_PrintPeaks(c0, c1, 5, cruise.mean[5], 1000.0f / 16384.0f, "Az (mg)");
-        Rec_PrintPeaks(c0, c1, 3, cruise.mean[3], 1000.0f / 16384.0f, "Ax (mg)");
-        UART_Print("(Gyro loc 41Hz, accel loc 20Hz -> rung tren ~50Hz bi lam yeu, khong thay ro)\r\n");
+    *contrast = (i_max < n) ? s_max - s_min : 0.0f;
+    if (i_max >= n || *contrast < SPIN_CAL_MIN_CONTRAST) return 0;
+    float thr = s_min + 0.7f * (s_max - s_min);
+    uint32_t a = i_max, b = i_max;
+    while (a > i0 && Spin_Signal(a - 1, n, pol) > thr) a--;
+    while (b + 1 < i1 && Spin_Signal(b + 1, n, pol) > thr) b++;
+    if (a == i0 || b + 1 == i1) return 0;          // Đỉnh bị cắt ở mép cửa sổ -> không tin
+    float w_sum = 0.0f, h_sum = 0.0f, d_sum = 0.0f;
+    for (uint32_t i = a; i <= b; i++) {
+        float w = Spin_Signal(i, n, pol) - thr;
+        w_sum += w;
+        h_sum += w * spin_rec[i].h;
+        d_sum += w * spin_rec[i].dd;
     }
-
-    // Dữ liệu thô từng mẫu
-    if (dump_raw) {
-        UART_Print("RAW,i,giai_doan,imu_moi,gx,gy,gz,ax,ay,az,xungT,xungP,wpid_x10\r\n");
-        for (uint32_t i = 0; i < n; i++) {
-            const ImuRec *r = &rec_buf.imu[i];
-            snprintf(msg, sizeof(msg), "RAW,%lu,%u,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n", (unsigned long)i, r->phase + 1, r->fresh,
-                     r->g[0], r->g[1], r->g[2], r->a[0], r->a[1], r->a[2], r->enc_l, r->enc_r, r->w_pid);
-            UART_Print(msg);
-        }
-    }
-    UART_Print("================ HET TEST RUNG ================\r\n");
-}
-
-// ===== TEST PID GIỮ HƯỚNG (Heading_PID_Test) =====
-// Đọc "Kp Ki Kd" (cách nhau bằng dấu cách / phẩy) từ 1 dòng UART. Thiếu số nào giữ số cũ. 1: đã đổi hệ số
-static uint8_t HP_ParseGains(const char *line)
-{
-    float v[3] = { heading_kp, heading_ki, heading_kd };
-    const char *p = line;
-    int got = 0;
-    for (int i = 0; i < 3; i++) {
-        char *end;
-        float x = strtof(p, &end);
-        if (end == p) break;
-        v[i] = x;
-        got++;
-        p = end;
-        while (*p == ' ' || *p == ',' || *p == ';' || *p == '\t') p++;
-    }
-    if (got == 0) return 0;
-    if (v[0] < 0.0f || v[0] > 100.0f || v[1] < 0.0f || v[1] > 200.0f || v[2] < 0.0f || v[2] > 5.0f) {
-        UART_Print("He so ngoai khoang (Kp 0..100, Ki 0..200, Kd 0..5) -> giu nguyen\r\n");
-        return 0;
-    }
-    heading_kp = v[0];
-    heading_ki = v[1];
-    heading_kd = v[2];
+    *h  = h_sum / w_sum;
+    *dd = d_sum / w_sum;
     return 1;
 }
-// Lịch bậc hướng đích: chạy HP_T0_MS rồi đổi +STEP, 0, -STEP, 0, mỗi bậc HP_STEP_MS (luồng chính đổi)
-static const float hp_steps[4] = { HP_STEP_DEG, 0.0f, -HP_STEP_DEG, 0.0f };
-static struct { uint32_t t0; int k; } hp;
-static void HP_Hook(void)
+void Gyro_Spin_Calibrate(uint8_t turns)
 {
-    uint32_t t = HAL_GetTick() - hp.t0;
-    if (t < HP_T0_MS) return;
-    int k = (int)((t - HP_T0_MS) / HP_STEP_MS);
-    if (k <= 3 && k != hp.k) {
-        hp.k = k;
-        heading_step_deg = hp_steps[k];
-    }
-}
-// Phân tích 1 bậc [s, e) và in 1 dòng. Đơn vị ghi: 0.01 độ, 0.1 độ/s
-static void HP_StepReport(uint32_t s, uint32_t e)
-{
-    const HeadRec *h = rec_buf.head;
-    float old_ref = (s > 0) ? h[s - 1].ref : 0.0f, new_ref = h[s].ref;
-    float delta = new_ref - old_ref, dir = (delta >= 0.0f) ? 1.0f : -1.0f;
-    int t_rise = -1, t_settle = 0;
-    float over = 0.0f, w_max = 0.0f, ess = 0.0f, rms = 0.0f;
-    uint32_t len = e - s, n_ss = 0, n_rms = 0;
-    for (uint32_t i = s; i < e; i++) {
-        float y = h[i].y, err = new_ref - y;
-        if (t_rise < 0 && delta != 0.0f && (y - old_ref) / delta >= 0.9f) t_rise = (int)(i - s) * 2;
-        if (dir * (y - new_ref) > over) over = dir * (y - new_ref);
-        if (fabsf(err) > HP_SETTLE_DEG * 100.0f) t_settle = (int)(i - s + 1) * 2;
-        if (fabsf((float)h[i].w_pid) > w_max) w_max = fabsf((float)h[i].w_pid);
-        if (i >= e - len * 3 / 10) { ess += err; n_ss++; }
-        if (i >= e - len / 2) { rms += err * err; n_rms++; }
-    }
-    char rise_str[12], settle_str[12];
-    if (t_rise >= 0) snprintf(rise_str, sizeof(rise_str), "%d", t_rise); else snprintf(rise_str, sizeof(rise_str), "--");
-    if ((uint32_t)t_settle < len * 2) snprintf(settle_str, sizeof(settle_str), "%d", t_settle); else snprintf(settle_str, sizeof(settle_str), "--");
-    snprintf(msg, sizeof(msg), "%+5.1f -> %+5.1f  %9s %9.0f %8s %+10.2f %8.2f %10.1f %6lu\r\n",
-             old_ref / 100.0f, new_ref / 100.0f, rise_str, (delta != 0.0f) ? over * 100.0f / fabsf(delta) : 0.0f,
-             settle_str, (n_ss > 0) ? ess / n_ss / 100.0f : 0.0f, (n_rms > 0) ? sqrtf(rms / n_rms) / 100.0f : 0.0f,
-             w_max / 10.0f, (unsigned long)len * 2);
-    UART_Print(msg);
-}
-void Heading_PID_Test(float dist_mm, uint8_t print_raw)
-{
+    float peak_h[11], peak_dd[11], contrast_min = 1e9f;
+    if (turns < 2) turns = 2;
+    if (turns > 10) turns = 10;
     if (!motor_hw_ok || !imu_ready) {
         UART_Print("\r\nLOI: dong co bi khoa (CubeMX) hoac IMU chua san sang (MPU6500_Setup) - khong chay duoc\r\n");
         HAL_Delay(1000);
         return;
     }
-    // 1. Nhận hệ số qua Bluetooth (hoặc 1 ký tự = giữ hệ số hiện tại)
-    char line[48];
-    snprintf(msg, sizeof(msg), "\r\nTest PID huong: gui 'Kp Ki Kd' (vd: 10 15 0.2) hoac 1 ky tu (vd: x) = giu Kp=%.2f Ki=%.2f Kd=%.3f\r\n",
-             heading_kp, heading_ki, heading_kd);
-    do { UART_Print(msg); } while (UART_ReadLine(line, sizeof(line), 5000) < 0);
-    if (HP_ParseGains(line)) UART_Print("Da doi he so.\r\n");
-    // Đủ chỗ cho 3 bậc đầu + 0.5s của bậc cuối (+ ~50mm tăng/giảm tốc)
-    float need_mm = MOVE_SPEED_MMS * (HP_T0_MS + 3 * HP_STEP_MS + 500) / 1000.0f + 50.0f;
-    if (fabsf(dist_mm) < need_mm) {
-        snprintf(msg, sizeof(msg), "Canh bao: %.0f mm ngan hon %.0f mm can cho du 4 buoc -> buoc cuoi bi cat\r\n", dist_mm, need_mm);
-        UART_Print(msg);
-    }
+    snprintf(msg, sizeof(msg), "\r\nHieu chinh gyro: dat xe cach tuong 3-10cm, mui huong vao tuong. Xe se quay trai %u vong.\r\n"
+             "Gui 1 ky tu de bat dau...\r\n", turns);
+    UART_WaitStart(msg);
 
-    // 2. Đứng yên 1s, chỉnh offset gyro + lấy gốc
+    // 1. Đứng yên 1s, đo lại offset gyro, lấy hướng ban đầu
     Motor_SetSpeed(0.0f, 0.0f);
     HAL_Delay(1000);
     Motion_Begin();
-    float h0 = heading_target * DEG2RAD;
-    uint32_t timeout_ms = Straight_Prepare(dist_mm);
-    float l0 = dist_left_mm, r0 = dist_right_mm;
+    float scale_old = yaw_scale, h0 = Robot_Heading();
 
-    // 3. Chạy, ghi mỗi 2ms, luồng chính đổi bậc hướng theo lịch (không gửi UART lúc chạy)
-    head_enc0 = enc_heading_deg;
-    hp.k = -1;
-    hp.t0 = HAL_GetTick();
-    head_rec_n = 0;
-    if (Motion_Start(MOTION_STRAIGHT)) Motion_Wait(timeout_ms, HP_Hook);
-    uint32_t n = head_rec_n;
-    head_rec_n = HEAD_REC_MAX;            // Ngừng ghi
-    heading_step_deg = 0.0f;
-    MotionResult result = motion_result;
-    float dl = dist_left_mm - l0, dr = dist_right_mm - r0;
-    float along   =  odo_x_mm * cosf(h0) + odo_y_mm * sinf(h0);
-    float lateral = -odo_x_mm * sinf(h0) + odo_y_mm * cosf(h0);
+    // 2. Quay trái đều SPIN_CAL_DPS, ghi dữ liệu, đủ (turns + 1) vòng + 180 độ thì dừng
+    float total = (turns + 1) * 360.0f + 180.0f;
+    float v = SPIN_CAL_DPS * DEG2RAD * TRACK_WIDTH_MM * 0.5f;
+    spin_rec_div = 0;
+    spin_rec_n = 0;
+    Motor_SetSpeed(-v, v);
+    uint32_t t0 = HAL_GetTick(), limit_ms = (uint32_t)(total / SPIN_CAL_DPS * 2000.0f) + 3000U;
+    while (Robot_Heading() - h0 < total && HAL_GetTick() - t0 < limit_ms && spin_rec_n < SPIN_CAL_MAX) {}
+    Motor_SetSpeed(0.0f, 0.0f);
+    uint32_t n = spin_rec_n;
+    spin_rec_n = SPIN_CAL_MAX;            // Ngừng ghi
+    HAL_Delay(600);                       // Chờ dừng hẳn
+    float h_end = Robot_Heading();
 
-    // 4. Tìm chỗ đổi bậc
-    uint32_t idx[6], n_idx = 0;
-    for (uint32_t i = 1; i < n && n_idx < 4; i++)
-        if (rec_buf.head[i].ref != rec_buf.head[i - 1].ref) idx[n_idx++] = i;
-    idx[n_idx] = n;
-
-    // 5. Báo cáo
-    const HeadRec *h = rec_buf.head;
-    UART_Print("\r\n================ TEST PID GIU HUONG (MPU6500) ================\r\n");
-    snprintf(msg, sizeof(msg), "PID huong: Kp=%.2f Ki=%.2f Kd=%.3f | bac +-%.1f do, moi bac %d ms | %.0f mm/s\r\n",
-             heading_kp, heading_ki, heading_kd, HP_STEP_DEG, HP_STEP_MS, MOVE_SPEED_MMS);
-    UART_Print(msg);
-    snprintf(msg, sizeof(msg), "Chinh offset gyro truoc khi chay: %s, da sua %+.2f do/s\r\n",
-             (rezero_status == HAL_OK) ? "OK" : "KHONG DUOC (xe bi cham / chua dung yen)",
-             (rezero_status == HAL_OK) ? gyro_z_rezero_dps : 0.0f);
-    UART_Print(msg);
-    snprintf(msg, sizeof(msg), "Ket qua: %s | quang duong %+.1f mm (trai %+.1f, phai %+.1f) | %lu mau\r\n",
-             motion_result_str[result], 0.5f * (dl + dr), dl, dr, (unsigned long)n);
-    UART_Print(msg);
-    // Giữ thẳng trước bậc đầu (bỏ 0.1s đầu lúc xuất phát)
-    uint32_t b1 = (n_idx > 0) ? idx[0] : n, b0 = (b1 > 50) ? 50 : 0;
-    float bsum = 0.0f, bsq = 0.0f;
-    for (uint32_t i = b0; i < b1; i++) { bsum += h[i].y; bsq += (float)h[i].y * h[i].y; }
-    if (b1 > b0) {
-        float bm = bsum / (b1 - b0);
-        snprintf(msg, sizeof(msg), "Giu thang truoc bac 1: lech TB %+.2f do, RMS %.2f do\r\n",
-                 -bm / 100.0f, sqrtf(bsq / (b1 - b0)) / 100.0f);
-        UART_Print(msg);
+    // 3. Chiều tín hiệu: đỉnh tường là cực đại hay cực tiểu (xét 1 vòng, bỏ 90 độ đầu lúc mới quay)
+    float mean = 0.0f, mx = 0.0f, mn = 1e9f;
+    uint32_t cnt = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (spin_rec[i].h < h0 + 90.0f || spin_rec[i].h >= h0 + 450.0f) continue;
+        float s = spin_rec[i].ir;
+        mean += s;
+        cnt++;
+        if (s > mx) mx = s;
+        if (s < mn) mn = s;
     }
-    UART_Print("Bac (do)        t_len(ms) Vot_lo(%) t_od(ms) Sai_so(do)  RMS(do) w_max(do/s) dai(ms)\r\n");
-    for (uint32_t k = 0; k < n_idx; k++) HP_StepReport(idx[k], idx[k + 1]);
-    if (n_idx == 0) UART_Print("(Khong co bac nao: xe dung truoc HP_T0_MS)\r\n");
-    UART_Print("t_len: dat 90% bac | Vot_lo: vuot qua dich | t_od: vao +-0.5 do | Sai_so: TB 30% cuoi | RMS: 50% cuoi\r\n");
-    if (n > 1) {
-        float dy = (h[n - 1].y - h[0].y) / 100.0f, de = (h[n - 1].enc - h[0].enc) / 100.0f;
-        snprintf(msg, sizeof(msg), "Trong luc chay: gyro quay %+.2f do, encoder quay %+.2f do (chenh %+.2f do)\r\n", dy, de, de - dy);
-        UART_Print(msg);
-    }
-    snprintf(msg, sizeof(msg), "Vi tri cuoi (uoc luong): doc %+.1f mm, ngang %+.1f mm (bac +5/-5 do moi bac %d ms -> ngang ~0)\r\n",
-             along, lateral, HP_STEP_MS);
-    UART_Print(msg);
-    UART_Print("Goi y: Vot_lo > 20% hoac dao dong -> giam Kp / tang Kd | t_len > 300ms -> tang Kp\r\n");
-    UART_Print("       Sai_so > 0.3 do -> tang Ki | w_max = 90 (cham gioi han) -> bac qua lon so voi Kp\r\n");
+    float pol = (cnt > 0 && mx - mean / cnt >= mean / cnt - mn) ? 1.0f : -1.0f;
 
-    if (print_raw) {
-        UART_Print("HP,t_ms,dat_do,gyro_do,enc_do,w_gyro_dps,w_pid_dps\r\n");
-        for (uint32_t i = 0; i < n; i += HP_RAW_DECIM) {
-            snprintf(msg, sizeof(msg), "HP,%lu,%.2f,%.2f,%.2f,%.1f,%.1f\r\n", (unsigned long)i * 2,
-                     h[i].ref / 100.0f, h[i].y / 100.0f, h[i].enc / 100.0f, h[i].rate / 10.0f, h[i].w_pid / 10.0f);
+    // 4. Đỉnh vòng đầu (trong 1 vòng bất kỳ sau 90 độ đầu), rồi lần theo từng vòng: +360 độ +- cửa sổ
+    const char *err = NULL;
+    uint8_t found = Spin_FindPeak(n, h0 + 90.0f, h0 + 450.0f, pol, &peak_h[0], &peak_dd[0], &contrast_min);
+    if (!found) err = "khong thay dinh tuong ro (dat gan tuong hon? IR co doc duoc khong?)";
+    for (uint8_t k = 1; k <= turns && !err; k++) {
+        float c;
+        float expect = peak_h[k - 1] + 360.0f;
+        if (!Spin_FindPeak(n, expect - SPIN_CAL_WINDOW_DEG, expect + SPIN_CAL_WINDOW_DEG, pol, &peak_h[k], &peak_dd[k], &c))
+            err = "mat dinh tuong o 1 vong (xe bi xe dich? co vat la?)";
+        if (c < contrast_min) contrast_min = c;
+    }
+    if (n >= SPIN_CAL_MAX && !err) err = "het bo nho ghi (giam so vong)";
+
+    UART_Print("\r\n================ HIEU CHINH GYRO BANG CACH TU QUAY ================\r\n");
+    snprintf(msg, sizeof(msg), "Quay trai %u vong @%.0f do/s | %lu mau | IR truoc %s khi gan tuong\r\n",
+             turns, SPIN_CAL_DPS, (unsigned long)n, (pol > 0.0f) ? "TANG" : "GIAM");
+    UART_Print(msg);
+
+    float scale_k = 1.0f;                 // Hệ số sửa độ nhạy: góc thật / góc gyro
+    if (!err) {
+        float gyro_deg = peak_h[turns] - peak_h[0];
+        scale_k = turns * 360.0f / gyro_deg;
+        float d_min = 1e9f, d_max = -1e9f;
+        for (uint8_t k = 1; k <= turns; k++) {
+            float d = peak_h[k] - peak_h[k - 1];
+            if (d < d_min) d_min = d;
+            if (d > d_max) d_max = d;
+            snprintf(msg, sizeof(msg), "  Vong %2u: dinh tuong o %+9.2f do gyro (cach vong truoc %.2f)\r\n", k, peak_h[k] - h0, d);
             UART_Print(msg);
         }
+        float track = (peak_dd[turns] - peak_dd[0]) / (turns * 2.0f * 3.14159265f);
+        if (fabsf(scale_k - 1.0f) > 0.08f) err = "sai so > 8% -> bat thuong, khong ap dung";
+        snprintf(msg, sizeof(msg), "Gyro do %u vong THAT = %.2f do (dung ra %u) -> gyro %s %.3f%% | do tuong phan IR %.0f\r\n",
+                 turns, gyro_deg, turns * 360, (gyro_deg > turns * 360.0f) ? "doc NHIEU" : "doc IT",
+                 fabsf(gyro_deg / (turns * 360.0f) - 1.0f) * 100.0f, contrast_min);
+        UART_Print(msg);
+        snprintf(msg, sizeof(msg), "Do on dinh: moi vong lech nhau toi da %.2f do | TRACK_WIDTH hieu dung khi quay: %.1f mm (dang dung %.1f)\r\n",
+                 d_max - d_min, track, TRACK_WIDTH_MM);
+        UART_Print(msg);
     }
-    UART_Print("================ HET TEST PID HUONG ================\r\n");
+    // 5. Áp dụng độ nhạy mới rồi quay về hướng ban đầu (góc thật đã quay = góc gyro x hệ số mới)
+    if (!err) {
+        yaw_scale = scale_old * scale_k;
+        snprintf(msg, sizeof(msg), "YAW_SCALE: %.5f -> %.5f  (DA AP DUNG. Chep vao pid.h: #define YAW_SCALE %.5ff)\r\n",
+                 scale_old, yaw_scale, yaw_scale);
+    } else {
+        snprintf(msg, sizeof(msg), "THAT BAI: %s -> giu YAW_SCALE %.5f\r\n", err, scale_old);
+    }
+    UART_Print(msg);
+    float turned = (h_end - h0) * scale_k;                       // Góc thật đã quay
+    float back = -(turned - 360.0f * roundf(turned / 360.0f));   // Còn lệch so với hướng ban đầu
+    Motion_Begin();                       // Đo lại offset, hướng gốc mới theo độ nhạy mới
+    uint8_t ok = Turn_Angle(back);
+    snprintf(msg, sizeof(msg), "Quay ve huong ban dau: %+.2f do -> %s%s\r\n", back, ok ? "OK" : "LOI",
+             err ? " (theo gyro CHUA hieu chinh -> co the lech)" : "");
+    UART_Print(msg);
+    UART_Print("================ HET ================\r\n");
 }
