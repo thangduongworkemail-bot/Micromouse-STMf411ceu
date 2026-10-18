@@ -6,8 +6,8 @@
   * Bố cục:
   *   1. Hằng số, dữ liệu
   *   2. Lớp thuật toán: bản đồ tường, flood fill, chọn hướng, GỘP Ô THẲNG, chuyển giai đoạn
-  *   3. Lớp phần cứng HW_*: chỗ DUY NHẤT gọi hàm của pid.c / adc.c / mpu6500.c / HAL
-  *   4. Máy trạng thái (DECIDE_PATH, MOVE_STRAIGHT, TURN_LEFT, TURN_RIGHT, U_TURN)
+  *   3. Lớp phần cứng HW_*: chỗ DUY NHẤT gọi hàm của pid.c / adc.c / mpu6500.c / HAL (đều không chặn)
+  *   4. Máy trạng thái (DECIDE_PATH, MOVE_STRAIGHT, TURN_LEFT, TURN_RIGHT, U_TURN, ALIGN, PAUSED)
   *   5. API + in bản đồ
   *
   * Tọa độ: (0,0) = ô xuất phát (góc Tây-Nam), x tăng về Đông, y tăng về Bắc. Hướng: 0 Bắc, 1 Đông, 2 Nam, 3 Tây.
@@ -17,10 +17,10 @@
   ******************************************************************************
   */
 #include "solving_maze.h"
-#include "main.h"           /* HAL_GetTick, HAL_Delay, UART_Print */
-#include "pid.h"            /* Move_Straight_Begin..., Turn_Angle, Wall_Align, Motion_Begin, Motor_SetSpeed */
+#include "main.h"           /* HAL_GetTick, UART_Print */
+#include "pid.h"            /* Move_Straight_Begin..., Turn_Angle_Begin, Wall_Align_Begin/Poll, Motion_SetOrigin */
 #include "adc.h"            /* IR_FL_Filt, IR_FR_Filt, IR_L_Filt, IR_R_Filt */
-#include "mpu6500.h"        /* MPU6500_ZeroGyroZ */
+#include "mpu6500.h"        /* robot_lifted */
 
 /* =====================================================================================================
  * 1. HẰNG SỐ + DỮ LIỆU
@@ -61,9 +61,13 @@ static uint8_t  st_cells = 0U;      /* Đích hiện tại = tâm ô thứ st_ce
 static uint8_t  st_sensed = 0U;     /* Đã đọc tường tới ô thứ mấy */
 static float    st_speed = MAZE_SEARCH_SPEED_MMS;
 static uint32_t st_t0 = 0U;
+/* Lệnh quay / căn tường đang theo dõi (không chặn) */
+static bool     act_started = false;  /* Đã bắt đầu lệnh của trạng thái hiện tại */
+static uint32_t act_t0 = 0U;          /* Lúc bắt đầu quay (giới hạn MAZE_TURN_TIMEOUT_MS) */
 #if (MAZE_ALIGN_ON_FRONT_WALL != 0)
-static uint32_t align_t = 0U;       /* Lúc căn tường gần nhất */
-static bool     align_done = false; /* Đã căn lần nào chưa */
+static uint32_t  align_t = 0U;        /* Lúc căn tường gần nhất */
+static bool      align_done = false;  /* Đã căn lần nào chưa */
+static MazeState align_next = MAZE_STATE_DECIDE_PATH;  /* Lệnh quay sau khi căn xong */
 #endif
 
 /* =====================================================================================================
@@ -92,11 +96,11 @@ static bool Cell_IsGoal(uint8_t x, uint8_t y)
 {
     return (x >= MAZE_GOAL_LO) && (x <= MAZE_GOAL_HI) && (y >= MAZE_GOAL_LO) && (y <= MAZE_GOAL_HI);
 }
-/* Ô đích của giai đoạn: về xuất phát -> (0,0), còn lại -> 4 ô tâm */
+/* Ô đích của giai đoạn: về xuất phát (khám phá về / quay về) -> (0,0), còn lại -> 4 ô tâm */
 static bool Cell_IsTarget(uint8_t x, uint8_t y, MazePhase ph)
 {
     bool t;
-    if (ph == MAZE_PHASE_SEARCH_START)
+    if ((ph == MAZE_PHASE_SEARCH_START) || (ph == MAZE_PHASE_RETURN))
     {
         t = (x == 0U) && (y == 0U);
     }
@@ -297,7 +301,7 @@ static uint16_t Plan_PathLength(bool optimistic)
 }
 
 /* =====================================================================================================
- * 3. LỚP PHẦN CỨNG - chỉ ở đây gọi hàm của dự án (pid.c, adc.c, mpu6500.c, HAL)
+ * 3. LỚP PHẦN CỨNG - chỉ ở đây gọi hàm của dự án (pid.c, adc.c, mpu6500.c, HAL). Mọi hàm đều KHÔNG CHẶN
  * =================================================================================================== */
 static float    HW_FrontIR(void)        { return 0.5f * (IR_FL_Filt() + IR_FR_Filt()); }   /* TB 2 mắt trước */
 /* Có vách bên: mắt bên (đã lọc) >= MAZE_SIDE_WALL_IR tính theo số của print_LED (IRL thô quy đổi về thang IR_L_Filt) */
@@ -307,23 +311,48 @@ static bool     HW_StraightBegin(float mm, float speed) { return Move_Straight_B
 static void     HW_StraightSetTarget(float mm)          { Move_Straight_SetTarget(mm); }
 static float    HW_StraightTraveled(void)               { return Move_Straight_Traveled(); }
 static uint8_t  HW_MotionStatus(void)   { return Motion_Status(); }
-static bool     HW_Turn(float deg)      { return Turn_Angle(deg) != 0U; }        /* Dương = trái, chờ quay xong */
+static bool     HW_TurnBegin(float deg) { return Turn_Angle_Begin(deg) != 0U; }   /* Dương = trái, theo dõi HW_MotionStatus */
 #if (MAZE_ALIGN_ON_FRONT_WALL != 0)
-static void     HW_AlignFrontWall(void) { (void)Wall_Align(); }                  /* Căn vuông góc + khoảng cách */
+static bool     HW_AlignBegin(void)     { return Wall_Align_Begin() != 0U; }      /* Căn vuông góc + khoảng cách */
+static uint8_t  HW_AlignPoll(void)      { return Wall_Align_Poll(); }             /* WALL_ALIGN_BUSY / _OK / _FAILED */
 #endif
-static void     HW_Stop(void)           { Motor_SetSpeed(0.0f, 0.0f); }
+static bool     HW_Lifted(void)         { return robot_lifted != 0U; }            /* Đang bị nhấc (mpu6500.c) */
+static void     HW_Stop(void)           { Motor_SetSpeed(0.0f, 0.0f); }           /* Giảm tốc rồi dừng */
+static void     HW_Brake(void)          { Motor_Stop(); }                         /* Phanh ngay, tắt PID */
 static uint32_t HW_Millis(void)         { return HAL_GetTick(); }
-static void     HW_Wait(uint32_t ms)    { HAL_Delay(ms); }
-static void     HW_BeginRun(void)       { Motion_Begin(); }          /* Đo lại offset gyro, hướng hiện tại = gốc */
-static void     HW_RezeroGyro(void)     { (void)MPU6500_ZeroGyroZ(); }
+static void     HW_SetOrigin(void)      { Motion_SetOrigin(); }   /* Hướng hiện tại = gốc (không đo lại gyro) */
 static void     HW_Print(const char *s) { UART_Print(s); }
 
 /* =====================================================================================================
- * 4. MÁY TRẠNG THÁI
+ * 4. MÁY TRẠNG THÁI (không chặn: mỗi lệnh chuyển động bắt đầu 1 lần rồi theo dõi ở các lần gọi sau)
  * =================================================================================================== */
+/* Khám phá: tường chưa biết coi như mở. Chạy nhanh / quay về: chỉ đi qua cạnh đã biết là mở */
+static bool Phase_Optimistic(MazePhase ph)
+{
+    return (ph == MAZE_PHASE_SEARCH_GOAL) || (ph == MAZE_PHASE_SEARCH_START);
+}
+static float Phase_Speed(MazePhase ph)
+{
+    float v = MAZE_SEARCH_SPEED_MMS;
+    if (ph == MAZE_PHASE_SPEED_RUN)
+    {
+        v = MAZE_RUN_SPEED_MMS;
+    }
+    else if (ph == MAZE_PHASE_RETURN)
+    {
+        v = MAZE_RETURN_SPEED_MMS;
+    }
+    else
+    {
+        /* Khám phá */
+    }
+    return v;
+}
+
 /* Tới ô đích của giai đoạn: chuyển giai đoạn.
- * Về tới xuất phát: so đường ngắn nhất CHỈ qua cạnh đã biết với đường lạc quan (cạnh chưa biết coi như mở). Bằng nhau
- * = đường đã biết chắc chắn ngắn nhất -> chạy nhanh; chưa bằng -> khám phá thêm vòng nữa (tối đa MAZE_MAX_ROUNDS) */
+ * Khám phá về tới xuất phát: so đường ngắn nhất CHỈ qua cạnh đã biết với đường lạc quan (cạnh chưa biết coi như mở).
+ * Bằng nhau = đường đã biết chắc chắn ngắn nhất -> xong MODE 1 (DONE); chưa bằng -> khám phá thêm vòng nữa (tối đa
+ * MAZE_MAX_ROUNDS). Chạy nhanh tới đích / quay về tới xuất phát -> DONE */
 static void Phase_Advance(void)
 {
     switch (maze_phase)
@@ -338,9 +367,7 @@ static void Phase_Advance(void)
         maze_stats.rounds++;
         if ((known != DIST_INF) && ((known == optim) || (maze_stats.rounds >= MAZE_MAX_ROUNDS)))
         {
-            maze_phase = MAZE_PHASE_SPEED_RUN;
-            HW_Wait(MAZE_RUN_START_DELAY_MS);
-            HW_RezeroGyro();
+            maze_phase = MAZE_PHASE_DONE;
         }
         else
         {
@@ -349,10 +376,26 @@ static void Phase_Advance(void)
         break;
     }
     case MAZE_PHASE_SPEED_RUN:
+    case MAZE_PHASE_RETURN:
         maze_phase = MAZE_PHASE_DONE;
         break;
     default:
         break;
+    }
+}
+
+/* Chuyển động hỏng: đang bị nhấc -> PAUSED (giữ ô hiện tại, chờ Maze_Resume), còn lại -> ERROR */
+static void Motion_Failed(void)
+{
+    HW_Brake();
+    act_started = false;
+    if (HW_Lifted())
+    {
+        maze_state = MAZE_STATE_PAUSED;
+    }
+    else
+    {
+        maze_state = MAZE_STATE_ERROR;
     }
 }
 
@@ -364,7 +407,7 @@ static void Straight_Start(uint8_t n)
     st_h = rob_h;
     st_cells = n;
     st_sensed = 0U;
-    st_speed = (maze_phase == MAZE_PHASE_SPEED_RUN) ? MAZE_RUN_SPEED_MMS : MAZE_SEARCH_SPEED_MMS;
+    st_speed = Phase_Speed(maze_phase);
     st_t0 = HW_Millis();
     if (HW_StraightBegin((float)n * MAZE_CELL_MM, st_speed))
     {
@@ -373,7 +416,7 @@ static void Straight_Start(uint8_t n)
     }
     else
     {
-        maze_state = MAZE_STATE_ERROR;
+        Motion_Failed();
     }
 }
 
@@ -395,7 +438,7 @@ static void Straight_Replan(uint8_t k)
 {
     const uint8_t x = Cell_StepX(st_x0, st_h, k);
     const uint8_t y = Cell_StepY(st_y0, st_h, k);
-    const bool    opt = (maze_phase != MAZE_PHASE_SPEED_RUN);
+    const bool    opt = Phase_Optimistic(maze_phase);
     uint8_t       want = k;
     if (!Cell_IsTarget(x, y, maze_phase))
     {
@@ -417,8 +460,8 @@ static void Straight_Replan(uint8_t k)
     }
 }
 
-/* Đoạn thẳng kết thúc (xe đứng yên): cập nhật ô hiện tại theo quãng đã đi (làm tròn tới tâm ô gần nhất) */
-static void Straight_Finish(float traveled, uint8_t status)
+/* Ô hiện tại theo quãng đã đi của đoạn thẳng (làm tròn tới tâm ô gần nhất) */
+static void Straight_SetPosition(float traveled)
 {
     float   cells_f = (traveled / MAZE_CELL_MM) + 0.5f;
     uint8_t k;
@@ -439,10 +482,15 @@ static void Straight_Finish(float traveled, uint8_t status)
     {
         maze_stats.run_cells = (uint16_t)(maze_stats.run_cells + k);
     }
+}
+
+/* Đoạn thẳng kết thúc (xe đứng yên): cập nhật ô hiện tại rồi quyết định tiếp */
+static void Straight_Finish(float traveled, uint8_t status)
+{
+    Straight_SetPosition(traveled);
     if (status == MOTION_STATUS_FAIL)
     {
-        HW_Stop();
-        maze_state = MAZE_STATE_ERROR;
+        Motion_Failed();
     }
     else
     {
@@ -456,27 +504,79 @@ static void Straight_Finish(float traveled, uint8_t status)
     }
 }
 
+/* Phải quay sang hướng d tại tâm ô hiện tại. Có tường trước -> căn tường trước trước (sửa hướng gyro + khoảng cách
+ * tới tường, tức vị trí dọc trong ô) rồi mới quay */
+static void Turn_Toward(uint8_t d)
+{
+    const uint8_t rel = (uint8_t)((d + 4U - rob_h) & 3U);
+    MazeState     turn;
+    if (rel == REL_RIGHT)
+    {
+        turn = MAZE_STATE_TURN_RIGHT;
+    }
+    else if (rel == REL_LEFT)
+    {
+        turn = MAZE_STATE_TURN_LEFT;
+    }
+    else
+    {
+        turn = MAZE_STATE_U_TURN;
+    }
+    act_started = false;
+    maze_state = turn;
+#if (MAZE_ALIGN_ON_FRONT_WALL != 0)
+    if (Map_HasWall(rob_x, rob_y, rob_h) &&
+        ((!align_done) || ((HW_Millis() - align_t) >= MAZE_ALIGN_MIN_INTERVAL_MS)))
+    {
+        align_next = turn;
+        maze_state = MAZE_STATE_ALIGN;
+    }
+#endif
+}
+
 /* STATE_DECIDE_PATH: xe đứng ở tâm ô (rob_x, rob_y) nhìn rob_h */
 static void State_DecidePath(void)
 {
     bool    opt;
     uint8_t d;
+    if (HW_Lifted())
+    {
+        /* 0. Đang bị nhấc: không đọc cảm biến (đọc toàn rác), dừng chờ đặt lại */
+        Motion_Failed();
+        return;
+    }
     /* 1. Tường trước ô hiện tại: đứng yên, tường gần (~24mm) -> tin cậy, ghi đè */
     Map_SetEdge(rob_x, rob_y, rob_h, HW_FrontIR() > MAZE_FRONT_NEAR_IR, true);
     /* 2. Tới ô đích của giai đoạn -> sang giai đoạn sau */
     if (Cell_IsTarget(rob_x, rob_y, maze_phase))
     {
+        const bool explore_goal = (maze_phase == MAZE_PHASE_SEARCH_GOAL);
         Phase_Advance();
+        if (explore_goal)
+        {
+            /* Đang dò map, chạm đích: phanh, chờ người gọi lưu Flash rồi Maze_CheckpointDone() mới đi tiếp */
+            HW_Brake();
+            maze_state = MAZE_STATE_CHECKPOINT;
+            return;
+        }
     }
     if (maze_phase == MAZE_PHASE_DONE)
     {
-        HW_Stop();
-        maze_state = MAZE_STATE_FINISHED;
+        /* 3a. Xong lượt. Đang ở ô xuất phát thì quay mũi về hướng Bắc (sẵn sàng cho lượt sau) rồi mới xong */
+        if ((rob_x == 0U) && (rob_y == 0U) && (rob_h != DIR_N))
+        {
+            Turn_Toward(DIR_N);
+        }
+        else
+        {
+            HW_Stop();
+            maze_state = MAZE_STATE_FINISHED;
+        }
     }
     else
     {
-        /* 3. Flood fill, chọn hướng */
-        opt = (maze_phase != MAZE_PHASE_SPEED_RUN);
+        /* 3b. Flood fill, chọn hướng */
+        opt = Phase_Optimistic(maze_phase);
         Flood_Fill(maze_phase, opt);
         d = Plan_BestDir(rob_x, rob_y, rob_h, opt);
         if (d == DIR_NONE)
@@ -484,40 +584,15 @@ static void State_DecidePath(void)
             HW_Stop();                                      /* Không còn đường tới đích */
             maze_state = MAZE_STATE_ERROR;
         }
+        else if (d == rob_h)
+        {
+            /* 4a. Đi thẳng: gộp mọi ô thẳng phía trước thành 1 đoạn */
+            Straight_Start(Plan_StraightCells(rob_x, rob_y, rob_h, maze_phase, opt));
+        }
         else
         {
-            const uint8_t rel = (uint8_t)((d + 4U - rob_h) & 3U);
-            if (rel == REL_STRAIGHT)
-            {
-                /* 4a. Đi thẳng: gộp mọi ô thẳng phía trước thành 1 đoạn */
-                Straight_Start(Plan_StraightCells(rob_x, rob_y, rob_h, maze_phase, opt));
-            }
-            else
-            {
-                /* 4b. Phải rẽ / quay đầu ngay tại tâm ô này. Có tường trước thì căn theo tường trước (sửa hướng gyro +
-                 *     khoảng cách tới tường, tức vị trí dọc trong ô) */
-#if (MAZE_ALIGN_ON_FRONT_WALL != 0)
-                if (Map_HasWall(rob_x, rob_y, rob_h) &&
-                    ((!align_done) || ((HW_Millis() - align_t) >= MAZE_ALIGN_MIN_INTERVAL_MS)))
-                {
-                    HW_AlignFrontWall();
-                    align_t = HW_Millis();
-                    align_done = true;
-                }
-#endif
-                if (rel == REL_RIGHT)
-                {
-                    maze_state = MAZE_STATE_TURN_RIGHT;
-                }
-                else if (rel == REL_LEFT)
-                {
-                    maze_state = MAZE_STATE_TURN_LEFT;
-                }
-                else
-                {
-                    maze_state = MAZE_STATE_U_TURN;
-                }
-            }
+            /* 4b. Phải rẽ / quay đầu ngay tại tâm ô này */
+            Turn_Toward(d);
         }
     }
 }
@@ -528,8 +603,8 @@ static void State_MoveStraight(void)
     const float   traveled = HW_StraightTraveled();
     const uint8_t status = HW_MotionStatus();
     const float   limit_ms = (float)MAZE_STRAIGHT_TIMEOUT_MS + ((2000.0f * (float)st_cells * MAZE_CELL_MM) / st_speed);
-    /* 1. Có thể vượt nhiều điểm đọc 1 lúc nếu vòng lặp bị chậm (vd in UART): đọc lần lượt */
-    while ((st_sensed < st_cells) &&
+    /* 1. Có thể vượt nhiều điểm đọc 1 lúc nếu vòng lặp bị chậm (vd in UART): đọc lần lượt. Bị nhấc thì không đọc */
+    while ((!HW_Lifted()) && (st_sensed < st_cells) &&
            (traveled >= ((((float)st_sensed + 1.0f) * MAZE_CELL_MM) - MAZE_SENSE_BEFORE_MM)))
     {
         st_sensed++;
@@ -552,20 +627,94 @@ static void State_MoveStraight(void)
     }
 }
 
-/* STATE_TURN_*: quay tại tâm ô (chặn tới khi xong), rồi quyết định tiếp */
+/* STATE_TURN_* (không chặn): lần đầu bắt đầu quay tại tâm ô, các lần sau theo dõi tới khi xong rồi quyết định tiếp */
 static void State_Turn(float deg, uint8_t new_h)
 {
-    if (HW_Turn(deg))
+    if (!act_started)
     {
-        rob_h = new_h;
-        maze_state = MAZE_STATE_DECIDE_PATH;
+        if (HW_TurnBegin(deg))
+        {
+            act_started = true;
+            act_t0 = HW_Millis();
+            if ((deg > 135.0f) || (deg < -135.0f))
+            {
+                maze_stats.uturns++;
+            }
+            else
+            {
+                maze_stats.turns90++;
+            }
+        }
+        else
+        {
+            Motion_Failed();
+        }
     }
     else
     {
-        HW_Stop();
-        maze_state = MAZE_STATE_ERROR;
+        const uint8_t status = HW_MotionStatus();
+        if (status == MOTION_STATUS_RUNNING)
+        {
+            if ((HW_Millis() - act_t0) > MAZE_TURN_TIMEOUT_MS)
+            {
+                act_started = false;
+                HW_Brake();
+                maze_state = MAZE_STATE_ERROR;
+            }
+        }
+        else if (status == MOTION_STATUS_DONE)
+        {
+            act_started = false;
+            rob_h = new_h;
+            maze_state = MAZE_STATE_DECIDE_PATH;
+        }
+        else
+        {
+            Motion_Failed();
+        }
     }
 }
+
+#if (MAZE_ALIGN_ON_FRONT_WALL != 0)
+/* STATE_ALIGN (không chặn): bắt đầu căn tường trước, theo dõi tới khi xong rồi sang lệnh quay đã chọn.
+ * Căn không được không phải lỗi (hướng giữ như cũ, vẫn quay); bị nhấc -> PAUSED */
+static void State_Align(void)
+{
+    if (!act_started)
+    {
+        align_t = HW_Millis();
+        align_done = true;
+        if (HW_AlignBegin())
+        {
+            act_started = true;
+        }
+        else if (HW_Lifted())
+        {
+            Motion_Failed();
+        }
+        else
+        {
+            maze_state = align_next;
+        }
+    }
+    else if (HW_AlignPoll() != WALL_ALIGN_BUSY)
+    {
+        act_started = false;
+        if (HW_Lifted())
+        {
+            Motion_Failed();
+        }
+        else
+        {
+            maze_state = align_next;
+        }
+    }
+    else
+    {
+        /* Đang căn */
+    }
+}
+#endif
 
 /* =====================================================================================================
  * 5. API
@@ -581,8 +730,186 @@ void Maze_Init(void)
 #if (MAZE_ALIGN_ON_FRONT_WALL != 0)
     align_done = false;
 #endif
-    HW_BeginRun();
+    act_started = false;
+    HW_SetOrigin();
     maze_state = MAZE_STATE_DECIDE_PATH;
+}
+
+bool Maze_HasPath(void)
+{
+    return Plan_PathLength(false) != DIST_INF;
+}
+
+bool Maze_StartSpeedRun(void)
+{
+    const bool ok = Maze_HasPath();
+    if (ok)
+    {
+        rob_x = 0U;
+        rob_y = 0U;
+        rob_h = DIR_N;
+        maze_phase = MAZE_PHASE_SPEED_RUN;
+        maze_stats.run_cells = 0U;
+        act_started = false;
+        HW_SetOrigin();
+        maze_state = MAZE_STATE_DECIDE_PATH;
+    }
+    return ok;
+}
+
+void Maze_StartReturn(void)
+{
+    maze_phase = MAZE_PHASE_RETURN;
+    act_started = false;
+    maze_state = MAZE_STATE_U_TURN;     /* Quay 180 độ trước, rồi DECIDE_PATH đi đường ngắn nhất về (0,0) */
+}
+
+void Maze_StartContinue(uint8_t x, uint8_t y, uint8_t h)
+{
+    rob_x = (x < MAZE_SIZE) ? x : 0U;
+    rob_y = (y < MAZE_SIZE) ? y : 0U;
+    rob_h = (uint8_t)(h & 3U);
+    maze_phase = Cell_IsGoal(rob_x, rob_y) ? MAZE_PHASE_SEARCH_START : MAZE_PHASE_SEARCH_GOAL;
+    maze_stats = (MazeStats){ 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U };
+#if (MAZE_ALIGN_ON_FRONT_WALL != 0)
+    align_done = false;
+#endif
+    act_started = false;
+    HW_SetOrigin();
+    maze_state = MAZE_STATE_DECIDE_PATH;    /* Bản đồ giữ nguyên: flood fill chỉ còn dò các cạnh chưa biết */
+}
+
+bool Maze_IsExplored(void)
+{
+    const uint16_t known = Plan_PathLength(false);
+    return (known != DIST_INF) && (known == Plan_PathLength(true));
+}
+
+void Maze_CheckpointDone(void)
+{
+    if (maze_state == MAZE_STATE_CHECKPOINT)
+    {
+        maze_state = MAZE_STATE_DECIDE_PATH;
+    }
+}
+
+void Maze_ExportMap(uint8_t out[MAZE_CELLS])
+{
+    uint8_t x;
+    uint8_t y;
+    for (x = 0U; x < MAZE_SIZE; x++)
+    {
+        for (y = 0U; y < MAZE_SIZE; y++)
+        {
+            out[((uint16_t)x * MAZE_SIZE) + y] = maze_map[x][y];
+        }
+    }
+}
+
+/* Bản đồ nạp vào phải hợp lệ: biên ngoài là tường đã biết, mỗi cạnh trong giống hệt nhau ở 2 ô kề */
+static bool Map_Consistent(const uint8_t in[MAZE_CELLS])
+{
+    bool    ok = true;
+    uint8_t x;
+    uint8_t y;
+    uint8_t d;
+    for (x = 0U; (x < MAZE_SIZE) && ok; x++)
+    {
+        for (y = 0U; (y < MAZE_SIZE) && ok; y++)
+        {
+            const uint8_t c = in[((uint16_t)x * MAZE_SIZE) + y];
+            for (d = 0U; (d < 4U) && ok; d++)
+            {
+                const int16_t nx = (int16_t)x + (int16_t)dir_dx[d];
+                const int16_t ny = (int16_t)y + (int16_t)dir_dy[d];
+                const uint8_t mask = (uint8_t)(Known_Bit(d) | Wall_Bit(d));
+                if (!Cell_Inside(nx, ny))
+                {
+                    ok = ((c & mask) == mask);
+                }
+                else
+                {
+                    const uint8_t o  = in[((uint16_t)nx * MAZE_SIZE) + (uint16_t)ny];
+                    const uint8_t od = Dir_Back(d);
+                    const bool    ka = (c & Known_Bit(d)) != 0U;
+                    const bool    kb = (o & Known_Bit(od)) != 0U;
+                    const bool    wa = (c & Wall_Bit(d)) != 0U;
+                    const bool    wb = (o & Wall_Bit(od)) != 0U;
+                    ok = (ka == kb) && (wa == wb);
+                }
+            }
+        }
+    }
+    return ok;
+}
+
+bool Maze_ImportMap(const uint8_t in[MAZE_CELLS])
+{
+    const bool ok = Map_Consistent(in);
+    uint8_t    x;
+    uint8_t    y;
+    if (ok)
+    {
+        for (x = 0U; x < MAZE_SIZE; x++)
+        {
+            for (y = 0U; y < MAZE_SIZE; y++)
+            {
+                maze_map[x][y] = in[((uint16_t)x * MAZE_SIZE) + y];
+            }
+        }
+    }
+    return ok;
+}
+
+void Maze_Pause(void)
+{
+    bool running = true;
+    switch (maze_state)
+    {
+    case MAZE_STATE_MOVE_STRAIGHT:
+        Straight_SetPosition(HW_StraightTraveled());    /* Đang chạy thẳng: làm tròn tới tâm ô gần nhất */
+        break;
+#if (MAZE_ALIGN_ON_FRONT_WALL != 0)
+    case MAZE_STATE_ALIGN:
+        if (act_started)
+        {
+            (void)HW_AlignPoll();                       /* Kết thúc lệnh căn đang dở (hướng đích về như cũ) */
+        }
+        break;
+#endif
+    case MAZE_STATE_DECIDE_PATH:
+    case MAZE_STATE_TURN_LEFT:
+    case MAZE_STATE_TURN_RIGHT:
+    case MAZE_STATE_U_TURN:
+    case MAZE_STATE_PAUSED:
+    case MAZE_STATE_CHECKPOINT:
+        break;                                          /* Đang đứng / quay tại tâm ô: giữ ô + hướng cũ */
+    default:
+        running = false;                                /* IDLE / FINISHED / ERROR: không có lượt nào đang chạy */
+        break;
+    }
+    if (running)
+    {
+        HW_Brake();
+        act_started = false;
+        maze_state = MAZE_STATE_PAUSED;
+    }
+}
+
+void Maze_Resume(void)
+{
+    if (maze_state == MAZE_STATE_PAUSED)
+    {
+        act_started = false;
+        maze_state = MAZE_STATE_DECIDE_PATH;           /* Đọc lại tường trước, tính lại đường từ ô đã chốt */
+    }
+}
+
+void Maze_GetPose(uint8_t *x, uint8_t *y, uint8_t *h)
+{
+    *x = rob_x;
+    *y = rob_y;
+    *h = rob_h;
 }
 
 MazeState Maze_Step(void)
@@ -596,20 +923,24 @@ MazeState Maze_Step(void)
         State_MoveStraight();
         break;
     case MAZE_STATE_TURN_LEFT:
-        maze_stats.turns90++;
         State_Turn(90.0f, Dir_Left(rob_h));
         break;
     case MAZE_STATE_TURN_RIGHT:
-        maze_stats.turns90++;
         State_Turn(-90.0f, Dir_Right(rob_h));
         break;
     case MAZE_STATE_U_TURN:
-        maze_stats.uturns++;
         State_Turn(180.0f, Dir_Back(rob_h));
         break;
+#if (MAZE_ALIGN_ON_FRONT_WALL != 0)
+    case MAZE_STATE_ALIGN:
+        State_Align();
+        break;
+#endif
     case MAZE_STATE_IDLE:
     case MAZE_STATE_FINISHED:
     case MAZE_STATE_ERROR:
+    case MAZE_STATE_PAUSED:
+    case MAZE_STATE_CHECKPOINT:                         /* Chờ Maze_CheckpointDone() */
     default:
         break;
     }

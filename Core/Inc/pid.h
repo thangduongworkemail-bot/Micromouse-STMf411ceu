@@ -18,12 +18,10 @@
 //   lệch 2 bánh (gyro giữ thẳng mà bánh phải đi nhiều hơn x%) -> trái nhân (1 + x/200), phải nhân (1 - x/200)
 #define WHEEL_DIAMETER_L      29.24f
 #define WHEEL_DIAMETER_R      29.03f
-#define WHEEL_DIAMETER        (0.5f * (WHEEL_DIAMETER_L + WHEEL_DIAMETER_R))   // Trung bình (để in / tham khảo)
 #define ENCODER_CPR           700.0f          // Số xung encoder / 1 vòng bánh
 #define MM_PER_COUNT_L        (3.14159265f * WHEEL_DIAMETER_L / ENCODER_CPR)
 #define MM_PER_COUNT_R        (3.14159265f * WHEEL_DIAMETER_R / ENCODER_CPR)
-#define MM_PER_COUNT          (3.14159265f * WHEEL_DIAMETER / ENCODER_CPR)    // Trung bình
-#define SPEED_LPF_ALPHA       0.3f            // Hệ số lọc thông thấp vận tốc đo (0..1, nhỏ = lọc mạnh)
+#define SPEED_LPF_ALPHA      0.3f            // Hệ số lọc thông thấp vận tốc đo (0..1, nhỏ = lọc mạnh)
 #define PWM_MAX               2999            // = ARR của TIM1 và TIM5
 #define MAX_SPEED_MMS         350.0f          // Giới hạn vận tốc đặt (mm/s). Đo được: 300 mm/s đã cần ~72% PWM
                                               // -> tối đa ~400 mm/s, chừa lại phần PWM cho PID tăng tốc/bù tải
@@ -245,7 +243,8 @@ float Ramp(float current, float target, float max_step);
 // Trả về 1: xong, 0: bị hủy (lệch hướng quá MOTION_ABORT_DEG / quá MOTION_TIMEOUT_MS / IMU, động cơ chưa sẵn sàng)
 extern float dist_left_mm, dist_right_mm; // Quãng đường cộng dồn từ vận tốc encoder (mm)
 extern float odo_x_mm, odo_y_mm;          // Vị trí ước lượng (encoder + gyro), gốc = lúc gọi Motion_Begin()
-void    Motion_Begin(void);               // Lấy vị trí + hướng hiện tại làm gốc (xe đứng yên)
+void    Motion_Begin(void);               // Lấy vị trí + hướng hiện tại làm gốc (xe đứng yên), đo lại gyro (chặn ~0.5s)
+void    Motion_SetOrigin(void);           // Như Motion_Begin nhưng không đo lại gyro (không chặn)
 // Đi thẳng dist_mm (âm = lùi) với tốc độ tối đa speed_mms (giới hạn MAX_SPEED_MMS), giữ hướng bằng gyro.
 // speed_mms = 0 hoặc dist_mm = 0: ĐỨNG GIỮ HƯỚNG - không đi, KHÔNG CHỜ (trả về ngay), ngắt TIM9 giữ mãi tới lệnh
 // chuyển động khác (Move_Straight đi / Turn_Angle / Motor_SetSpeed / Motor_Stop). Xoay tay lệch đi thì xe tự
@@ -262,7 +261,14 @@ uint8_t Move_Straight(float dist_mm, float speed_mms);
 // tuyệt đối được sửa theo tường, lệnh quay sau đó tính từ hướng đúng. Xong thì phanh đứng yên.
 // Trả về 1: xong, 0: không có tường / căn không được (hướng đích giữ nguyên, MPU không đổi)
 uint8_t Wall_Align(void);
-extern uint8_t wall_guard;                // 1 (mặc định): dừng trước tường + tránh tường bên + căn tường khi đứng, 0: tắt
+// Bản KHÔNG CHẶN (giải mê cung): Wall_Align_Begin() (0: không bắt đầu được) rồi gọi Wall_Align_Poll() mỗi vòng lặp
+// tới khi khác WALL_ALIGN_BUSY. Kết quả như Wall_Align (lỗi thì hướng đích giữ nguyên, MPU không đổi)
+#define WALL_ALIGN_BUSY       0U
+#define WALL_ALIGN_OK         1U
+#define WALL_ALIGN_FAILED     2U
+uint8_t Wall_Align_Begin(void);
+uint8_t Wall_Align_Poll(void);
+extern uint8_t wall_guard;               // 1 (mặc định): dừng trước tường + tránh tường bên + căn tường khi đứng, 0: tắt
 extern uint8_t wall_center;               // 1 (mặc định): đi thẳng tới thì cân giữa ô theo tường bên (WALL_CENTER_), 0: tắt
 // ĐI THẲNG KHÔNG CHỜ (giải mê cung chạy liên tục, solving_maze.c): như Move_Straight nhưng trả về ngay; đổi đích
 // khi đang chạy (kéo dài: chạy tiếp không giảm tốc, rút ngắn: hãm vừa kịp dừng ở đích mới). Không tự căn tường
@@ -275,12 +281,12 @@ void    Move_Straight_SetTarget(float dist_mm);                // Quãng đườ
 float   Move_Straight_Traveled(void);                          // Quãng đường đã đi từ lúc Begin (mm)
 uint8_t Motion_Status(void);                                   // MOTION_STATUS_*
 uint8_t Turn_Angle(float deg);            // Quay tại chỗ: dương = trái, âm = phải
+uint8_t Turn_Angle_Begin(float deg);      // Như trên nhưng không chờ: theo dõi bằng Motion_Status(), 0 = không quay được
 uint8_t Turn_Left(float deg);
 uint8_t Turn_Right(float deg);
 float   Robot_Heading(void);              // Hướng xe (độ), dương = trái, không quấn về +-180
 // NHẤC / ĐẶT XE (tự động, xem mpu6500.h): nhấc lên thì mọi lệnh chạy bị hủy / từ chối (trả 0), động cơ phanh;
 // đặt xuống nằm yên ~1s thì hướng lúc đặt = góc 0, LED PB15 sáng. Lệnh chạy dở KHÔNG tự chạy tiếp.
-void    Robot_WaitPlaced(void);           // Chờ tới khi xe nằm trên sàn (đang trên sàn thì trả về ngay)
 void    Motion_OnLifted(void);            // Gọi trong ngắt IMU khi phát hiện bị nhấc (không gọi từ main)
 void    Motion_OnPlaced(void);            // Gọi trong ngắt IMU khi xe vừa đặt xuống (không gọi từ main)
 extern float yaw_scale;                   // Độ nhạy gyro đang dùng (khởi đầu = YAW_SCALE, Gyro_Spin_Calibrate sửa)

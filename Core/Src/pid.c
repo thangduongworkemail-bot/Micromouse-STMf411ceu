@@ -783,6 +783,12 @@ void Motion_Begin(void)
 {
     Motor_SetSpeed(0.0f, 0.0f);
     MPU6500_ZeroGyroZ();                  // Bánh quay / bị chạm thì giữ offset cũ
+    Motion_SetOrigin();
+}
+// Như Motion_Begin nhưng KHÔNG đo lại gyro (không chặn). Mode Manager đo lại gyro trước bằng MPU6500_ZeroGyroZ_Start/Poll
+void Motion_SetOrigin(void)
+{
+    Motor_SetSpeed(0.0f, 0.0f);
     heading_target = Robot_Heading();
     odo_x_mm = 0.0f;
     odo_y_mm = 0.0f;
@@ -802,12 +808,6 @@ void Motion_OnPlaced(void)
     heading_set    = 1;
     odo_x_mm       = 0.0f;
     odo_y_mm       = 0.0f;
-}
-// Chờ tới khi xe nằm trên sàn (đặt xuống + nằm yên LIFT_PLACE_S). Xe đang trên sàn thì trả về ngay
-void Robot_WaitPlaced(void)
-{
-    while (robot_lifted) {
-    }
 }
 // Bắt đầu 1 đoạn (không chờ). 0: động cơ bị khóa / IMU chưa sẵn sàng / xe đang bị nhấc
 static uint8_t Motion_Start(MotionMode mode)
@@ -882,12 +882,23 @@ uint8_t Move_Straight(float dist_mm, float speed_mms)
 uint8_t Turn_Angle(float deg)
 {
     if (!heading_set) Motion_Begin();
+    if (!Turn_Angle_Begin(deg)) return 0;
+    return Motion_Wait(MOTION_TIMEOUT_MS + (uint32_t)(2000.0f * fabsf(deg) / TURN_SPEED_DPS));
+}
+// Quay KHÔNG CHẶN: bắt đầu rồi trả về ngay, theo dõi bằng Motion_Status() (RUNNING -> DONE / FAIL), người gọi tự
+// giới hạn thời gian. 0: không quay được (động cơ khóa / IMU chưa sẵn sàng / bị nhấc), hướng đích giữ nguyên
+uint8_t Turn_Angle_Begin(float deg)
+{
+    if (!heading_set) Motion_SetOrigin();
     Motor_SetSpeed(0.0f, 0.0f);
     heading_target  += deg;
     motion_turn_dir  = (deg >= 0.0f) ? 1.0f : -1.0f;
     motion_abort_deg = fabsf(deg) + MOTION_ABORT_DEG;   // Quay ngược chiều quá MOTION_ABORT_DEG -> sai dấu gyro
-    if (!Motion_Start(MOTION_TURN)) return 0;
-    return Motion_Wait(MOTION_TIMEOUT_MS + (uint32_t)(2000.0f * fabsf(deg) / TURN_SPEED_DPS));
+    if (!Motion_Start(MOTION_TURN)) {
+        heading_target -= deg;
+        return 0;
+    }
+    return 1;
 }
 uint8_t Turn_Left(float deg)  { return Turn_Angle(deg); }
 uint8_t Turn_Right(float deg) { return Turn_Angle(-deg); }
@@ -934,27 +945,48 @@ uint8_t Motion_Status(void)
 // (WS_DONE) / không căn được (WS_FAIL), rồi thôi giữ, phanh đứng yên như các lệnh chặn khác
 uint8_t Wall_Align(void)
 {
+    uint8_t r;
     if (!heading_set) Motion_Begin();
-    float h_ref = heading_target;                 // Hướng xe được lệnh đi = hướng sẽ gán cho pháp tuyến tường
+    if (!Wall_Align_Begin()) return 0;
+    while ((r = Wall_Align_Poll()) == WALL_ALIGN_BUSY) {
+    }
+    return r == WALL_ALIGN_OK;
+}
+// Bản KHÔNG CHẶN (giải mê cung): Begin rồi gọi Poll mỗi vòng lặp tới khi khác WALL_ALIGN_BUSY.
+// Poll trả kết quả đúng 1 lần (lần đó thôi giữ, phanh đứng yên); gọi tiếp sau đó trả WALL_ALIGN_FAILED
+static float    wa_href;                          // Hướng xe được lệnh đi = hướng sẽ gán cho pháp tuyến tường
+static uint32_t wa_t0;
+static uint8_t  wa_active = 0;
+uint8_t Wall_Align_Begin(void)
+{
+    if (!heading_set) Motion_SetOrigin();
+    wa_href = heading_target;
     Motor_SetSpeed(0.0f, 0.0f);
     ws_force = 1;                                 // Không thấy tường -> WS_FAIL ngay (không chờ mãi)
     if (!Motion_Start(MOTION_HOLD)) {
         ws_force = 0;
         return 0;
     }
-    uint32_t t0 = HAL_GetTick();
-    while (motion_mode == MOTION_HOLD && ws != WS_DONE && ws != WS_FAIL && HAL_GetTick() - t0 < WALL_ALIGN_TIMEOUT_MS) {
-    }
+    wa_t0     = HAL_GetTick();
+    wa_active = 1;
+    return 1;
+}
+uint8_t Wall_Align_Poll(void)
+{
+    if (!wa_active) return WALL_ALIGN_FAILED;
+    if (motion_mode == MOTION_HOLD && ws != WS_DONE && ws != WS_FAIL && HAL_GetTick() - wa_t0 < WALL_ALIGN_TIMEOUT_MS)
+        return WALL_ALIGN_BUSY;
     uint8_t ok = (motion_mode == MOTION_HOLD && ws == WS_DONE);
-    ws_force = 0;
+    wa_active = 0;
+    ws_force  = 0;
     Motor_SetSpeed(0.0f, 0.0f);
     if (!ok) {
         if (motion_result != MOTION_LIFTED && motion_result != MOTION_NOT_READY) motion_result = MOTION_WALL_FAIL;
-        heading_target = h_ref;                   // Lệnh sau vẫn tính theo hướng cũ
-        return 0;
+        heading_target = wa_href;                 // Lệnh sau vẫn tính theo hướng cũ
+        return WALL_ALIGN_FAILED;
     }
     motion_result = MOTION_WALL;
-    return 1;
+    return WALL_ALIGN_OK;
 }
 
 // ===== TEST / DEBUG =====

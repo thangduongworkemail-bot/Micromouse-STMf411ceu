@@ -17,6 +17,7 @@
 #include "adc.h"            // cảm biến hồng ngoại
 #include "pid.h"            // động cơ + encoder + PID vận tốc
 #include "solving_maze.h"   // giải mê cung flood fill, chạy liên tục
+#include "mode_manager.h"   // chọn chế độ bằng IR trái + còi PB8, MODE 1 / MODE 2, tạm dừng khi nhấc xe
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -121,6 +122,15 @@ void UART_WaitStart(const char *prompt)
         if (HAL_UART_Receive(&huart1, &c, 1, 2000) == HAL_OK) return;
     }
 }
+// Đọc 1 ký tự USART1 KHÔNG CHỜ: -1 = chưa có. Đọc SR (cờ) rồi DR -> xóa cả RXNE lẫn cờ tràn ORE
+// (ký tự đến lúc không ai đọc, vd đang chạy mê cung, thì chỉ giữ ký tự cuối)
+int UART_TryRead(void)
+{
+    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE) || __HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)) {
+        return (int)(huart1.Instance->DR & 0xFFU);
+    }
+    return -1;
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -211,14 +221,18 @@ int main(void)
   // Move_Straight(180.0f, 250.0f); Turn_Right(90.0f); Turn_Left(90.0f);   // các lệnh lẻ (chờ xong mới chạy lệnh sau)
   // Move_Straight(0.0f, 0.0f);       // tốc độ 0: ĐỨNG GIỮ HƯỚNG, trả về ngay, xoay tay thì xe tự quay về
                                        // (giữ tới lệnh chuyển động khác; while(1) vẫn chạy, vd in print_mpu6500)
-  // GIẢI MÊ CUNG (solving_maze.c): đặt xe ở TÂM ô xuất phát, mũi ra lối mở, đứng yên rồi:
-   Maze_Init(); while (Maze_Step() != MAZE_STATE_FINISHED && Maze_GetState() != MAZE_STATE_ERROR) {}
-   Maze_SendMap();                   // gửi bản đồ đã vạch qua UART (HC-05) cho maze/maze_viewer.py
+  // GIẢI MÊ CUNG: do mode_manager.c điều khiển (trước đây gọi trực tiếp:
+  //   Maze_Init(); while (Maze_Step() != MAZE_STATE_FINISHED && Maze_GetState() != MAZE_STATE_ERROR) {} Maze_SendMap();)
+  // Đặt xe ở TÂM ô xuất phát, mũi hướng Bắc (ra lối mở). Che mắt IR trái N lần (mỗi lần còi kêu 1 tiếng), hết còi 3s
+  // không che = chạy MODE N: 1 dò tiếp map cũ trong Flash, 2 chạy nhanh + quay về, 3 dò map mới (1 tiếng bíp dài).
+  // MODE 1 khi Flash trống, MODE 2 khi Flash trống / map chưa có đường tới đích: 3 bíp lỗi, xe không chạy.
+  // Bản đồ lưu Flash sector 7 (còn sau khi tắt nguồn) và gửi qua HC-05 cho maze/maze_viewer.py khi xong mỗi lượt và
+  // mỗi khi máy tính gửi 1 ký tự lúc xe đứng chờ.
+  ModeManager_Init();
   while (1)
   {
-	  // maze_viewer.py gửi 1 ký tự để xin bản đồ -> gửi lại (mở chương trình lúc nào cũng nhận được)
-	  UART_WaitStart("Gui 1 ky tu de nhan ban do me cung\r\n");
-	  Maze_SendMap();
+
+	  ModeManager_Update();             // Không chặn: gọi liên tục, KHÔNG thêm HAL_Delay vào vòng lặp này
 
 	 // Move_Straight(0.0f, 0.0f);
 	//  print_LED();
@@ -772,7 +786,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_8, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
@@ -783,8 +797,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB14 PB15 */
-  GPIO_InitStruct.Pin = GPIO_PIN_14|GPIO_PIN_15;
+  /*Configure GPIO pins : PB14 PB15 PB8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_8;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -813,6 +827,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
         Motor_Speed_Tick();
         // 2. Ra lệnh đọc IMU bằng DMA; đọc xong HAL gọi HAL_I2C_MemRxCpltCallback (mpu6500.c)
         MPU6500_Tick();
+        // 3. Bảo vệ: phát hiện nhấc xe bằng encoder / IR khi đang chạy (mode_manager.c), khóa động cơ ngay
+        (void)Check_Robot_Picked_Up();
     }
 }
 /* USER CODE END 4 */

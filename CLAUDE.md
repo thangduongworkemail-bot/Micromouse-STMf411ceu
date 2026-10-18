@@ -14,8 +14,10 @@ Application code is split by subsystem. Each module's header is in `Core/Inc/`:
 | `main.h` (`USER CODE` EC/EFP) | `CONTROL_DT` (shared 2 ms tick) and the `CDC_Print`/`CDC_WaitHost`/`UART_Print`/`UART_WaitStart` prototypes |
 | `pid.c` / `pid.h` | Motor driver, encoders, velocity PID, the outer motion loop (`Move_Straight`/`Turn_Angle`, encoder distance plus gyro heading), `PID_Test`, `Rectangle_Test`, `Straight_Test`. All tuning and pin/sign config `#define`s live in `pid.h` |
 | `mpu6500.c` / `mpu6500.h` | **MPU6500 only**, no MPU6050/9250 code paths, I2C address `MPU6500_ADDR`. IMU init (including a `WHO_AM_I` read into `mpu_whoami`: 0x70 MPU6500, or 0x71 for the MPU9250 die actually fitted) and calibration, DMA read tick, `HAL_I2C_MemRxCpltCallback`, `HAL_I2C_ErrorCallback` (counts I2C errors), angle math, `MPU6500_Test` |
-| `adc.c` / `adc.h` | IR ADC+DMA start, emitters, `adc_value[]`, front and side sensor equalization (`IR_FrontLeft`/`IR_FrontRight`, `IR_Left`/`IR_Right`), filtered values for control (`IR_Tick`, `IR_*_Filt`) |
-| `solving_maze.c` / `solving_maze.h` | On-robot flood-fill maze solver with continuous straights (see "Maze solver"). It is not called from `main` yet; there is a commented example in the `WHILE` block |
+| `adc.c` / `adc.h` | IR ADC+DMA start, emitters, `adc_value[]`, front and side sensor equalization (`IR_FL_ToRef`, `IR_L_ToRef`), filtered values for control (`IR_Tick`, `IR_*_Filt`) |
+| `solving_maze.c` / `solving_maze.h` | On-robot flood-fill maze solver with continuous straights (see "Maze solver"). Fully non-blocking; driven by `mode_manager.c` |
+| `flash_storage.c` / `flash_storage.h` | Maze map persistence in Flash sector 7 (`FlashMapData`, append log + CRC32, see "Flash map storage") |
+| `mode_manager.c` / `mode_manager.h` | Mode Manager + Safety (see "Mode Manager"). 3 modes since 2026-10-15. The IR-left "virtual button" with the PB8 buzzer, MODE 1 (explore) / MODE 2 (fast run + return home), and pause/resume when the robot is picked up. `while(1)` only calls `ModeManager_Update()` |
 
 `Simulator/mms-c/` is **host-side C, not firmware**. It is a vendored copy of github.com/mackorone/mms-c at commit `0342718` (2019-09-21), with its `.git` removed. It is the algorithm template for the mms Micromouse simulator.
 - `API.c/h` (`API_wallFront()`, `API_moveForward()`, which returns 0 on crash, and so on) speaks the stdin/stdout protocol, so log through stderr only. The logger is named `log_msg` because `log` clashes with the C builtin.
@@ -57,7 +59,7 @@ C:\ST\STM32CubeIDE_1.19.0\STM32CubeIDE\headless-build.bat -data C:\Users\ADMIN\S
 
 On a workspace where the project isn't imported yet, add `-import <repo path>`. The IDE compiles only these source folders: `Core`, `Core/Startup`, `Drivers`, `Middlewares`, `USB_DEVICE`.
 
-Flash over ST-Link SWD:
+Flash over ST-Link SWD. Sector 7 holds the saved maze map and is outside the image, so a normal flash keeps it; a full chip erase wipes it:
 
 ```bash
 "$TC/com.st.stm32cube.ide.mcu.externaltools.cubeprogrammer.win32_2.2.200.202503041107/tools/bin/STM32_Programmer_CLI.exe" -c port=SWD -w Debug/version1.elf -v -rst
@@ -78,7 +80,9 @@ Compiler settings to know about:
   - `PFP`: the USB print helpers
   - `2`: the start-up order `ADC_IR_Start()` → `Motor_Init()` → `HAL_TIM_Base_Start_IT(&htim9)`, with TIM9 last so the ISR never sees an uninitialized module
   - `WHILE`, before `while(1)`: `ADC_IR_EmittersOn()`, then `MPU6500_Setup()` (init plus about 1.2 s of calibration, which then sets `imu_ready`)
-  - `4`: the TIM9 callback, which only calls `Motor_Speed_Tick()` and then `MPU6500_Tick()`
+  - `WHILE`: `ModeManager_Init()`, then `while(1) { ModeManager_Update(); }`. Never add `HAL_Delay` there.
+  - `4`: the TIM9 callback calls `Motor_Speed_Tick()`, `MPU6500_Tick()`, then `Check_Robot_Picked_Up()`.
+  - `PFP`: also `UART_TryRead()`, a non-blocking single-byte USART1 read that clears RXNE/ORE.
 - New `.c` files under `Core/Src` are compiled automatically, but the IDE only sees files created outside it after a **Refresh (F5)** of the project. A missing module shows up as `undefined reference` at link time. For CLI builds, `Debug/Core/Src/subdir.mk` and `Debug/objects.list` must also list the file; an IDE or headless build regenerates both. The same applies when CubeMX enables a new HAL module. For example, USART1 needed `stm32f4xx_hal_uart.c` added by hand to `Debug/Drivers/STM32F4xx_HAL_Driver/Src/subdir.mk` and `objects.list` before the CLI build would link.
 - `Drivers/` and `Middlewares/` are vendor code copied in by CubeMX. Don't modify them.
 - Put new `#include`s in `USER CODE BEGIN Includes`. That block currently has `<math.h>` and `"usbd_cdc_if.h"`; `<stdio.h>`/`<string.h>` come in indirectly via `usb_device.h` → `usbd_def.h` → `usbd_conf.h`. The Debug build has zero warnings, so keep it that way.
@@ -100,14 +104,15 @@ Clocks: 25 MHz HSE → PLL → 60 MHz SYSCLK. APB1 runs at 30 MHz, and all timer
 | Telemetry | USB OTG FS, CDC virtual COM port | PA11/PA12 | Sent with `CDC_Print()` |
 | Bluetooth (HC-05) | USART1, currently **9600** 8N1 to match the HC-05 default; no DMA/IRQ | TX PA15, RX PB3 (AF7) | `UART_Print()` (blocking; its timeout scales with length/baud, because a fixed 100 ms cut lines at 9600) and `UART_WaitStart()` (waits for any received byte) in `main.c`. At 9600 a ~90-character `print_mpu6500` line takes about 95 ms. Switching the HC-05 to 115200 (`AT+UART`) and CubeMX to match makes it 12× faster. PA9/PA10 stay IR emitters |
 | MPU status LED | GPIO | PB14 | `main.c` (user code) writes 1 when `MPU6500_Setup()` returns HAL_OK, 0 otherwise |
+| Buzzer | GPIO | PB8 | Configured in CubeMX (`GPIO_Output`). `BUZZER_ON`/`BUZZER_OFF` in `mode_manager.h`, assumed active-high and an *active* buzzer (DC on = sound) |
 | Run LED | GPIO | PB15 | On while the robot sits on the floor and may move; off while it is lifted (see "Lift detection"). The polarity is `LED_RUN_ON`/`LED_RUN_OFF` in `mpu6500.h`, assumed active-high like PB14 |
 
-**Control-loop data flow (interrupt-driven; `while(1)` is empty):**
+**Control-loop data flow (interrupt-driven; `while(1)` only runs `ModeManager_Update()`):**
 1. Every 2 ms, TIM9 fires `HAL_TIM_PeriodElapsedCallback` in `main.c`.
 2. It calls `Motor_Speed_Tick()` (`pid.c`). That function reads `TIM3->CNT` and `TIM2->CNT` and computes wrap-safe deltas (`(int16_t)(uint16_t curr - prev)`).
 3. It then calls `Motor_Speed_Control(delta_left, delta_right)`, the velocity loop:
    - It converts the deltas to mm/s and low-pass filters them (`speed_*_mms`).
-   - It integrates the **unfiltered** speed × dt into `dist_left_mm`/`dist_right_mm`, which equals counts × `MM_PER_COUNT` with no filter lag. It also dead-reckons `odo_x_mm`/`odo_y_mm` from the centre distance and `Robot_Heading()`.
+   - It integrates the **unfiltered** speed × dt into `dist_left_mm`/`dist_right_mm`, which equals counts × `MM_PER_COUNT_L`/`_R` with no filter lag. It also dead-reckons `odo_x_mm`/`odo_y_mm` from the centre distance and `Robot_Heading()`.
    - It calls `IR_Tick()` (`adc.c`), which filters the four IR channels for the wall logic.
    - It calls `Motion_Update()`, the outer loop. When a motion is active, this writes `target_speed_*` (see "Outer motion loop" below).
    - It ramps `ref_speed_*` toward `target_speed_*` at no more than `MAX_ACCEL_MMS2`.
@@ -207,14 +212,14 @@ How it works:
   - **Limit:** above IRFR about 1720, IRFL is in the knee (3775–3800), and it saturates fully at about 3830 above about 1850. Where the knee sits varies about 8% between sessions: at IRFL 3771, session 3 read IRFR about 1860 and session 5 about 1720. **Square up at IRFR ≤ about 1650.** IRFR 1800–2000 can't be calibrated until the left channel's sensitivity is reduced in hardware.
   - Session-to-session scatter of stationary placements at the same IRFL is ±0.03 in r. That scatter, not the knot spacing, now limits accuracy. `IR_FL_ToRef(≥3800)` = 1870. Real C function on all 3 logs: monotonic, identical to the Python model.
 - **The side table (IRL → IRR) was NOT refit from that log.** The user asked for it, but the log only contains a front wall. Facing a front wall, Lq/IRR is 0.60–0.65 at every distance, while side-wall data (IRL.log/IRR.log) gives 1.00. The side eyes see a front wall asymmetrically (right eye about 1.6× stronger; aim or mounting) but side walls equally. Fitting the side table to front-wall data would inflate left side-wall readings about 1.6× and break `WALL_SIDE_IR` avoidance. Re-measure the side pair with side walls (same 13-distance procedure) if needed.
-- API: `IR_FrontLeft()` (mapped), `IR_FrontRight()` (raw), `IR_FrontLeftSaturated()`. `print_LED` adds `FLq` (mapped IRFL), plus ` BH` when saturated, and `r:` (filtered (FLq − FR)/(FLq + FR), for `WALL_R_OFFSET`).
+- API: `IR_FL_ToRef(raw)` maps one IRFL reading; control code reads the filtered `IR_FL_Filt()`/`IR_FR_Filt()`. `print_LED` adds `FLq` (mapped IRFL), plus ` BH` when saturated, and `r:` (filtered (FLq − FR)/(FLq + FR), for `WALL_R_OFFSET`).
 - While IRFL is saturated it carries no distance information, so the two sides can't be compared near the wall. That is exactly where front-wall alignment in a cell would happen: with the axle at the cell centre the robot front is about 14 mm from the wall. The fix is hardware: lower the left channel's sensitivity about 2.5×, via emitter or receiver resistor, then re-measure the table.
 - The table must be re-measured after any emitter or receiver change.
 - **Side pair** (`IRL.log`/`IRR.log`, same day): a side wall was placed at the same 13 distances for each eye (the user didn't give the actual distances).
   - Plateau detection gives 13 levels for IRL after merging sub-plateaus caused by hand adjustments.
   - IRR gave 14. Its 1094 and 1060 plateaus are only 3% apart, against an 8–17% step between distances, and a bump separates them, so they were treated as one distance.
   - Each table point is the median of the **last** stable sub-plateau at that distance. For IRL level 6 that means 621 rather than the earlier 572, which was recorded while something was near the right sensor.
-- The side eyes already roughly match (IRR/IRL 0.91–1.09, max about 1270, no saturation). IRR is the reference, and `IR_L_ToRef()` uses a 13-point table through the shared `IR_Interp()`: proportional below the table, last slope extrapolated above it, clamped to 4095. API: `IR_Left()` (mapped) and `IR_Right()` (raw). `print_LED` adds `Lq`.
+- The side eyes already roughly match (IRR/IRL 0.91–1.09, max about 1270, no saturation). IRR is the reference, and `IR_L_ToRef()` uses a 13-point table through the shared `IR_Interp()`: proportional below the table, last slope extrapolated above it, clamped to 4095. API: `IR_L_ToRef(raw)`; control code reads the filtered `IR_L_Filt()`/`IR_R_Filt()`. `print_LED` adds `Lq`.
 - The refactor of `IR_FL_ToRef` onto `IR_Interp` was checked identical for all 4096 inputs.
 - Known gap: with no front wall, IRFL reads about 240–330 while IRFR reads about 20–60. The front table maps that to about 80–110, because its lowest point (486 → 164) still had a wall in view. An anchor around (290 → 30) would fix it, but the level depends on ambient light.
 
@@ -302,8 +307,19 @@ How it works:
   - Map: one byte per cell, wall bits plus known bits, edges written on both sides.
   - BFS uses a static queue: no recursion, no heap and no stdio.
   - Config defines are wrapped in `#ifndef` so a host test can override them.
-- **State machine.** `MAZE_STATE_DECIDE_PATH`, `MOVE_STRAIGHT` (non-blocking, polled by `Maze_Step()`), `TURN_LEFT`/`TURN_RIGHT`/`U_TURN` (blocking `Turn_Angle`), then `FINISHED`/`ERROR`.
-  - Phases: SEARCH_GOAL (unknown walls treated as open), then SEARCH_START (both at `MAZE_SEARCH_SPEED_MMS` 300 mm/s, raised from 250 on 2026-10-14; sim at 300: front-wall stop peak IR about 1760–1790, centring unchanged), then SPEED_RUN (known walls only, 350 mm/s), then DONE.
+- **State machine** (fully non-blocking since 2026-10-15). It has these states:
+  - `MAZE_STATE_DECIDE_PATH`;
+  - `MOVE_STRAIGHT`, using `Move_Straight_Begin`;
+  - `TURN_LEFT`/`TURN_RIGHT`/`U_TURN`, using `Turn_Angle_Begin` + `Motion_Status`, with `MAZE_TURN_TIMEOUT_MS`;
+  - `ALIGN`, using `Wall_Align_Begin`/`Poll` before a turn with a front wall;
+  - `FINISHED`/`ERROR`;
+  - `PAUSED`.
+
+  Each motion is started once (`act_started`) and polled on later `Maze_Step()` calls.
+  - A motion failure while `robot_lifted` → `PAUSED`, with the cell and heading kept; anything else → `ERROR`. `DECIDE_PATH` checks `robot_lifted` first, so it never reads sensors while lifted. Straight sensing is skipped while lifted.
+  - `Maze_Pause()` rounds a running straight to the nearest cell centre: the same rounding as `Straight_Finish`, and consistent with what was sensed. It also finishes a pending align. `Maze_Resume()` goes back to `DECIDE_PATH`, which re-reads the front wall and re-plans from the saved cell.
+  - Phases (enum values unchanged for the viewer; `RETURN` = 4 appended): SEARCH_GOAL (unknown walls treated as open), then SEARCH_START (both at `MAZE_SEARCH_SPEED_MMS` 300 mm/s, raised from 250 on 2026-10-14; sim at 300: front-wall stop peak IR about 1760–1790, centring unchanged). Exploration now ends in DONE at (0,0) (MODE 1). There is no automatic speed run any more: `Maze_StartSpeedRun()` (MODE 2, known walls only, 350 mm/s, refuses without a known path) → DONE at the goal; `Maze_StartReturn()` (U-turn, then known-only shortest path to (0,0) at `MAZE_RETURN_SPEED_MMS` 300) → DONE. A run that ends DONE at (0,0) first turns to face North, so it is ready for the next run.
+  - `Maze_Init`/`Maze_StartSpeedRun` only call `Motion_SetOrigin()` (no gyro re-zero); the Mode Manager re-zeros the gyro beforehand, non-blocking. `MAZE_RUN_START_DELAY_MS`, `HW_Wait` and `HW_RezeroGyro` are gone.
   - On returning to start, if the known-only and optimistic shortest paths are equal the path is proven optimal; otherwise it runs another round, up to `MAZE_MAX_ROUNDS`.
 - **Merging straight cells.**
   - `Plan_StraightCells` walks the flood-fill gradient while the best direction stays the current heading. Ties prefer straight, then right, left, back. The robot gets one goal at the centre of the last such cell.
@@ -315,7 +331,7 @@ How it works:
   - If the far reading misses a wall, the IR front stop (`MOTION_STATUS_WALL`) catches it. The cell is then rounded from the distance travelled and the wall written as known.
   - At rest the front wall is re-read near (`MAZE_FRONT_NEAR_IR`) and overwrites the map. Readings taken while moving only fill unknown edges.
   - Before a turn with a front wall it runs `Wall_Align` (`MAZE_ALIGN_ON_FRONT_WALL`, `MAZE_ALIGN_MIN_INTERVAL_MS`). That re-squares heading and also centres the robot along the cell, but only if `WALL_TARGET_IR` equals the IR reading at the cell centre.
-- **Host sim** (`scratchpad/maze_sim`): the real `solving_maze.c` with mock headers, motion with a √ profile, 2000 mm/s² ramp and IR front stop, front IR from true wall distance, diagonal side IR, noise, and a nose-collision check. On 60 real 16×16 mazes:
+- **Host sim** (`scratchpad/maze_sim`, written for the old blocking API; `scratchpad/mm_sim` is the current harness, see "Mode Manager"): the real `solving_maze.c` with mock headers, motion with a √ profile, 2000 mm/s² ramp and IR front stop, front IR from true wall distance, diagonal side IR, noise, and a nose-collision check. On 60 real 16×16 mazes:
   - 60/60 finished, 0 collisions, and the speed run equalled the true shortest path in every maze.
   - No stops mid-path. The only "stop then straight" events (21) are the deliberate stop on reaching the goal before the return.
   - The same holds with 15% IR noise, and with the far front reading disabled: the IR stop then caught 3–43 walls per maze.
@@ -324,7 +340,7 @@ How it works:
 - **Needs hardware calibration:** `MAZE_SIDE_WALL_IR`, `MAZE_FRONT_FAR_IR` (front-eye mean with the wall about 114 mm away), `MAZE_FRONT_NEAR_IR`, `MAZE_SENSE_BEFORE_MM` (about 40 if the side eyes look straight sideways), and `WALL_TARGET_IR` = the cell-centre front reading.
 - Straights centre in the corridor from the side walls (`wall_center`, see "Cell centring while driving straight" under Walls) on top of the gyro PD and `WALL_SIDE_IR` avoidance.
 - The CLI build needed `solving_maze` added by hand to `Debug/Core/Src/subdir.mk` and `objects.list`. In the IDE, use Refresh (F5).
-- **Map to PC** (2026-10-13). `main.c` (`WHILE` block) runs `Maze_Init()`, the `Maze_Step()` loop, then `Maze_SendMap()`. Inside `while(1)` it calls `UART_WaitStart(...)` and then `Maze_SendMap()` again, so any byte from the PC re-sends the map.
+- **Map to PC** (2026-10-13; since 2026-10-15 driven by the Mode Manager). The map is sent after each finished MODE 1 / return-home / error. In IDLE, any byte from the PC (`UART_TryRead`) re-sends it; this blocks about 1 s at 9600 baud, robot stopped. `UART_WaitStart` is no longer used by `main`.
   - Format (stdio-free, documented in `solving_maze.h`): `#MAZE_BEGIN n`, `#STATE`, `#ROBOT x y h`, `#STATS`, n× `#ROW y <hex bytes>` (the firmware cell bytes), and `#MAZE_END <sum of bytes mod 65536>`.
   - At 9600 baud it is about 800 bytes, about 1 s.
 - **`maze/maze_viewer.py`** (host PC; Python 3 + tkinter; pyserial for `--port`; no matplotlib or Pillow).
@@ -347,6 +363,105 @@ How it works:
     - `hang://`, a pyserial handler whose write blocks 10 s and close 5 s, with reconnect and disconnect clicked meanwhile: max gap 32 ms.
     - A TCP fake robot appearing 5 s late, sending a corrupt block, then a good one, then dropping: max gap 85 ms; the map was drawn and the drop was detected and reconnected.
     - Real COM8 with the robot off: max gap 97 ms, clear "HC-05 không trả lời" message, retries.
+
+**Mode Manager + Safety** (`mode_manager.c/.h`, 2026-10-15, user request: "Mode Manager and Safety System, buzzer on PB8, absolutely no `HAL_Delay`, everything as state machines on `HAL_GetTick()`").
+- **Timing rule.** Every wait stores `t0 = HAL_GetTick()` on entry and checks `(now − t0) ≥ duration` on later `ModeManager_Update()` calls. The unsigned subtraction is wrap-safe. Nothing in the mode or maze path busy-waits any more:
+  - turns, wall alignment and the start-of-run gyro re-zero all use start/poll APIs;
+  - the only remaining blocking calls are UART prints and `Maze_SendMap` (about 1 s at 9600, no TX DMA/IRQ configured), and they run only while the robot is stopped.
+- **Buzzer:** a non-blocking pattern player. A pattern is an array of ms durations alternating ON/OFF. On each step boundary `bz_t0 += step` (not `= now`), so loop jitter never accumulates. Patterns:
+  - every ON pulse is `BUZZ_ON_MS` = 500 ms (user setting 2026-10-15; was 2 s for UI/goal and 150 ms for confirm/error);
+  - per press: one 500 ms beep, always at least `UI_BEEP_GAP_MS` 300 after the previous one. Presses faster than the buzzer are queued (`ui_beeps_due`) and played in turn, so the number of beeps always equals the number of presses. (Restarting the pattern on each press, as before, lost beeps at ~4 presses/s: 4 presses gave 2 beeps.);
+  - MODE 3 confirm: one `CONFIRM_LONG_BEEP_MS` 1500 ms beep (the user asked for "1 tiếng bíp dài");
+  - goal: 500 / `GOAL_BEEP_GAP_MS` 500 / 500;
+  - error ("tít tít tít"): 3 × 500 with 150 gaps, both for a rejected selection and for a run error.
+- **Virtual button** = IR left raw (`adc_value[1]`, the `print_LED` IRL column).
+  - A press is > `UI_IR_PRESS_RAW` 3000 continuously for `UI_DEBOUNCE_MS` 30.
+  - It only counts if the hand was removed (< `UI_IR_RELEASE_RAW` 2000) since the last press, including after power-up. Holding the hand never counts twice.
+- **Three modes** (2026-10-15 rework; `RunMode`). The map persists in Flash sector 7 (see "Flash map storage"):
+  - **MODE_1, continue the old map:** the Flash map is imported into RAM by `Check_Mode` → `Maze_StartContinue` from (0,0) facing North (`MODE1_START_AT_SAVED_POS` 1 = from the saved cell and heading instead). All known walls are kept and flood fill only explores what is unknown. A map that is already `Maze_IsExplored()` still runs (goal and back, re-checking walls; "map da du: di kiem tra lai"). It no longer switches to MODE_2.
+  - **MODE_2, fast run + return:** runs on the Flash map (imported by `Check_Mode`). Fast run → goal beeps 0.5 s ×2 → U-turn → shortest known path home → face North.
+  - **MODE_3, new map:** `Maze_Init()` (RAM map cleared), then immediately saves an empty-map record (`FLASH_SAVE_NEW`) on top of the old one, so a power cut mid-run never resumes the old maze map. Then it explores.
+- **UI: number of covers = mode number** (2026-10-15 rework, user request "che 1 lần = luôn luôn Mode 1, 2 lần = Mode 2, 3 lần = Mode 3"). There is no suggested mode and no automatic mode change any more; `Suggest_Mode`/`Mode_Next` are gone and `mm_mode` starts as `MODE_NONE`.
+  - In IDLE, each press counts (`ui_count`) and beeps once. After the beeps end, 3 s (`UI_WINDOW_MS`) without a press → `Select_Mode(ui_count)` runs the **safety check while the robot is still stopped**:
+    - 1 → MODE_1: `Flash_LoadMap` must succeed and `Maze_ImportMap` must accept the map, otherwise rejected.
+    - 2 → MODE_2: additionally `FLASH_MAP_HAS_PATH` and `Maze_HasPath()` after import. "Map dở" (partial) means no known-only path to the goal yet, matching the earlier wording. A map that has a path but is not proven optimal (`FLASH_MAP_EXPLORED` clear) is accepted.
+    - 3 → MODE_3: always valid → long confirm beep → run.
+    - 0 or ≥ 4 → rejected, so an accidental extra cover can never wipe the map.
+  - Rejected: UART "Che N lan: KHONG CHAY - <reason>", 3 error beeps, `STATE_ERROR` → IDLE. No save and no map send, and the robot never moves.
+- **States** (`RobotState`):
+  - `STATE_IDLE`: motors stopped (`Motor_Stop`); serves map requests.
+  - `STATE_UI_BEEP` (press beeps playing, including queued ones) → `STATE_UI_WINDOW` (3 s count): as above.
+  - `STATE_START` waits `MODE_START_DELAY_MS` 1 s, until the hand is off the left eye, `!robot_lifted` and the buzzer is idle (so MODE_3 starts after the long beep). It then re-zeros the gyro (`MPU6500_ZeroGyroZ_Start/Poll`, about 0.5 s) and calls `Start_Mode1/2/3`.
+  - `STATE_EXPLORE` (MODE_1 and MODE_3):
+    - maze `CHECKPOINT` (goal reached while exploring, robot braked) → `Save_Map(FLASH_SAVE_GOAL)` → `Maze_CheckpointDone()`;
+    - `FINISHED` → `Save_Map(FLASH_SAVE_EXPLORED)`; send the map; IDLE;
+    - `ERROR` → `Enter_Error(…, save)`.
+  - `STATE_MODE2_RUN` → at the goal, `STATE_GOAL_BEEP` → `Maze_StartReturn()` → `STATE_RETURN_HOME` → at (0,0) facing North → IDLE.
+  - `STATE_ERROR`: a run error saves `FLASH_SAVE_ERROR` if a run was active and sends the map. Both run errors and rejected selections then give 3 beeps and go to IDLE.
+  - Moving states are EXPLORE/MODE2/RETURN. If `robot_lifted` or the maze reports `PAUSED` → `Enter_Paused()`:
+    - `Maze_Pause()` and `Motor_Stop()`;
+    - prints "TAM DUNG (nhac xe: …): dat lai o (x,y) mui huong …" over UART;
+    - `Save_Map(FLASH_SAVE_LIFTED)`.
+  - **Save points** (`Save_Map`): `Motor_Stop()` first; it exports the map, pose, phase, rounds and the HAS_PATH/EXPLORED flags, then prints "LUU FLASH (…) lan #n … -> OK". Saves happen only when stopped: at the goal and at the end of exploration, on a lift, on an error, and at the start of MODE 3. Never while driving.
+  - **`STATE_PAUSED` → `STATE_RESUME`** needs 5 s (`PAUSE_STILL_MS`) of continuous stillness:
+    - every IR channel within max(25, 8%) of the snapshot;
+    - wheels rolled ≤ 1 mm;
+    - `lift_acc_dev` ≤ 4 mg;
+    - |yaw rate| ≤ 2 °/s.
+
+    Any violation restarts the 5 s. At the end `!robot_lifted` (the IMU set-down, about 1 s calm) must also hold. RESUME calls `Maze_Resume()` and returns to the interrupted state. **The user must put the robot back at the printed cell centre and heading.**
+- **`Check_Robot_Picked_Up()`** runs in the TIM9 ISR after `MPU6500_Tick()`. It counts 2 ms ticks; there is no `HAL_GetTick` in the ISR.
+  1. **IMU** (primary, always on): `robot_lifted` from `Lift_Update`.
+  2. **Encoder**, only in moving states: a wheel *faster* than its ramped reference by > `PICKUP_ENC_OVERSPEED_MMS` 120 for `PICKUP_ENC_MS` 30, when |ref| > 50, means it lost its load. Collisions and stuck wheels make it slower, so they don't trigger this.
+  3. **IR**, only in moving states and with both wheels < 10 mm/s:
+     - a strong wall (front ≥ 300 or side ≥ 170) was seen ≤ 300 ms before;
+     - then all 4 eyes drop below the no-wall level (front < 130, side < 110) for 60 ms.
+
+     It is not used while driving, because driving into an open area also drops all eyes.
+
+  Secondary detections call `MPU6500_ForceLifted()`. That enters the same lifted state as the accelerometer (motion cancelled, motors locked, PB15 off); set-down is still confirmed by `Lift_Update`. The reason (`PICKUP_BY_*`) is printed. Both encoder and IR thresholds are untested on hardware; disable them with `PICKUP_ENC_ENABLE`/`PICKUP_IR_ENABLE`.
+- **pid.c/mpu6500.c additions for this:**
+  - `Motion_SetOrigin()` (= `Motion_Begin` without the gyro re-zero; `Motion_Begin` now calls it);
+  - `Turn_Angle_Begin()` (`Turn_Angle` = Begin + `Motion_Wait`; a refused start now restores `heading_target`);
+  - `Wall_Align_Begin()/Poll()` → `WALL_ALIGN_BUSY/OK/FAILED` (`Wall_Align` = Begin + loop);
+  - `MPU6500_ZeroGyroZ_Start()/Poll()` → `GYRO_ZERO_RUNNING` or a HAL status (`MPU6500_ZeroGyroZ` = Start + loop);
+  - `MPU6500_ForceLifted()`.
+
+  The full-robot `wall_sim2` results (APPROACH/CLOSE/ENDWALL/HOLDWALL/CORRIDOR/CENTER) are identical before and after the refactor.
+- **Sim** (`scratchpad/mm_sim`): the real `mode_manager.c` + `solving_maze.c` on real mazes, with mock motion, IMU and buzzer GPIO, a 1 ms loop, and `Check_Robot_Picked_Up` every 2 ms.
+  - Buzzer (pre-rework measurement): 500 (UI) / 500-500-500 (goal). Window 3000 ms. Start 1500 ms after confirmation.
+  - Full explore → MODE 2 → return flow correct on 29/30 competition mazes: speed run = true shortest path, back at (0,0) facing N, no crash. The 30th (`001-anomaly-test`, no path to centre) correctly ends in ERROR.
+  - A lift mid-straight pauses instantly at the rounded cell, and the run resumes exactly 5.000 s after placement. A wheel roll of 3 mm or 50 ms of 8 mg vibration restarts the 5 s.
+  - Encoder overspeed is detected in 30 ms, IR vanish while aligning in 60 ms. All runs then complete correctly.
+
+**Flash map storage** (`flash_storage.c/.h`, 2026-10-15, user request: "sector 7, Magic_Word 0xA5A5B6B6, map + last X/Y, save when exploring reaches the goal and on errors, never continuously").
+- **Linker:** `STM32F411CEUX_FLASH.ld` sets FLASH = 384K (sectors 0–6). Sector 7 (0x08060000–0x0807FFFF, 128 KB) is never part of the image:
+  - flashing the `.elf` (CLI `-w`, IDE launch) erases only the program sectors and keeps the map;
+  - "Full chip erase", `-e all` or an RDP regression wipes it;
+  - code larger than 384 KB fails to link.
+- **`FlashMapData`**, 280 B (word multiple, `_Static_assert`):
+  - `magic_word` 0xA5A5B6B6, `version` 1, `record_size`, `sequence`;
+  - `maze_map[256]` (byte x·16+y, same bits as RAM);
+  - `last_x`/`last_y`/`last_heading`, `phase`, `rounds`, `reason` (`FLASH_SAVE_NEW/GOAL/EXPLORED/LIFTED/ERROR`), `flags` (`FLASH_MAP_HAS_PATH`/`EXPLORED`);
+  - `checksum` (bitwise CRC-32 of everything before it).
+- **Append log (wear leveling).** The sector holds 468 slots, written sequentially.
+  - `Flash_SaveMap`: Unlock → (erase sector 7 only if no blank slot is left, or if `FLASH_ERASE_EVERY_SAVE` is 1) → program word by word into the next fully blank slot → Lock → flush the ART data cache (`DCEN` is on) → `memcmp` verify.
+  - `Flash_LoadMap`: the first blank slot is found by first words. Then it walks back to the last record with a valid magic/version/size/CRC, usually 1 CRC.
+  - A power loss mid-write leaves an invalid slot: load falls back to the previous record and the next save skips past it. Erase-before-write would lose both copies.
+  - `Flash_EraseMap` wipes the sector.
+- **Stalls:** the F411 has a single bank, so programming (a few ms per record) and erasing (about 1–2 s, only when full) stall instruction fetch and delay every IRQ, including the PID tick and SysTick. Callers therefore `Motor_Stop()` first and only save when the robot is stationary.
+- `Maze_ExportMap`/`Maze_ImportMap`: the import rejects maps whose boundary is not known wall or whose two sides of an edge disagree. Also added: `Maze_StartContinue`, `Maze_IsExplored`, and `MAZE_STATE_CHECKPOINT` + `Maze_CheckpointDone`. `MAZE_STATE_CHECKPOINT` is appended (enum 10); `maze_viewer.py` knows it.
+- **Sim** (`scratchpad/mm_sim/sim2.c`): the real `flash_storage.c` + `mode_manager.c` + `solving_maze.c` against a Flash mock (erase = 0xFF, programming only clears bits and fails on a non-blank word, optional power cut after N words), with power cycles (RAM cleared, Flash kept).
+  - 1000 saves → 2 erases, 0 read/write errors.
+  - A power cut mid-write → the previous record loads; the next save skips the broken slot.
+  - Cover-count UI (scenario `ui`, empty Flash):
+    - 1 cover → 1 beep, then rejected with 3 × 500 beeps, robot still;
+    - 2 slow covers (2 s apart, the 2nd during the window) → 2 beeps, rejected;
+    - 4 fast covers (250 ms period) → 4 beeps, rejected;
+    - 3 fast covers → 3 beeps + 1500 ms → MODE 3 explores.
+  - `full`: 3 covers → MODE 3 explored (flags HAS_PATH | EXPLORED) → power cycle → 2 covers → fast run = true shortest path, home → power cycle → 1 cover on the complete map → MODE 1 runs (goal and back) → erase Flash → 2 covers and 1 cover are both rejected.
+  - `partial`: MODE 3 lifted after 10 cells → power cycle → 2 covers rejected ("map do") → 1 cover continues and finishes → 2 covers → correct fast run.
+  - 120 competition mazes: 266/270 runs correct (`ui`/`full`/`partial` on the first 30, `full`/`partial` on the next 90), 0 Flash faults. The two failures are `001.txt` and `001-anomaly-test.txt` in `full`/`partial`. The harness's own BFS also finds no path to the goal there; the firmware correctly errors and rejects MODE 2.
 
 **Lift detection** (2026-10-10, user request) is automatic. It runs in `Lift_Update()` at the end of `MPU6500_Process_Data`, in the I2C ISR, using the accelerometer only. The gyro is avoided because a fast turn in place would otherwise look like a tilt whenever the accel reference is misaligned. Thresholds are the `LIFT_*` defines in `mpu6500.h`.
 - **Lifted** when either condition holds for `LIFT_CONFIRM_S` (20 ms):
@@ -373,7 +488,7 @@ How it works:
   - `yaw_angle` = 0, so the initial angle is the angle at set-down;
   - PB15 turns on;
   - `Motion_OnPlaced()` sets `heading_target` and resets the odometry origin.
-- Interrupted motions do not resume. `Robot_WaitPlaced()` blocks until the robot is on the floor.
+- Interrupted motions do not resume by themselves. The Mode Manager pauses an interrupted maze run and resumes it after the robot is put back and stays still for 5 s (see "Mode Manager + Safety").
 - **Sim** (`scratchpad/lift_sim`): the real code, a 3-axis IMU with the board's (0.16, 0.15, −1.17) g rest reading modelled both as accel offsets and as a ~10° chip tilt, driving vibration, centripetal force at 35 mm from the axle, and hand tremor.
   - No false lift during driving at 350 mm/s, 180° turns, a hard brake from 350, hitting a wall at 300, hold mode with hand rotation on the floor, or a 4 s spin. Worst cases were tilt 6.7° and |vz| 0.054 m/s.
   - A lift is detected in 70–110 ms.
@@ -394,6 +509,12 @@ Inertia doesn't matter, because only peak positions taken during the steady spin
 `Rectangle_Test(length, width)` drives 4 sides with a right turn after each, then `CDC_WaitHost()` and prints a per-segment report: target vs achieved, final heading error, max deviation or overshoot, time, and result. It ends with the odometry end position.
 
 The blocking calls are split into `Motion_Start` (non-blocking start) and `Motion_Wait(timeout)`.
+
+Dead code removed on 2026-10-14 (user request; still in commit `e811747` on `main`):
+- mpu6500: the MPU6050-style globals `Accel_*_RAW`/`Gyro_*_RAW`/`Ax..Gz`, blocking `MPU6500_Read_All`, `I2C_ScanAndPrint_CDC` and `MPU6500_YawWrapped`. `MPU6500_Init` now uses the `REG_*` defines instead of literals.
+- adc: the raw getters `IR_FrontLeft`/`IR_FrontRight`/`IR_FrontLeftSaturated`/`IR_Left`/`IR_Right`. Only the `_Filt` versions were used.
+- pid: `Robot_WaitPlaced` and the unused average defines `WHEEL_DIAMETER`/`MM_PER_COUNT`.
+- The test and print tools were deliberately kept: `PID_Test`, `MPU6500_Test`, `Rectangle_Test`, `Straight_Test`, `Gyro_Spin_Calibrate`, `print_*`, `Maze_PrintMap`. So were the API pairs `Turn_Left`/`Turn_Right` and `Maze_GetPhase`/`Maze_GetStats`. With `--gc-sections` they cost no flash or RAM until main calls them.
 
 Removed test tools (2026-10-09, they are in git commit `cbc3493` on branch `TEST_PID` if needed again):
 - `Straight_Log_UART`: live gyro vs encoder log over Bluetooth;
@@ -430,7 +551,7 @@ To fix the wheel direction, flip `MOTOR_*_SIGN`; to fix the encoder direction, f
 
 The `print_LED()`, `print_mpu6500()` and `print_SpeedPID()` helpers are debug output, meant to be called by hand from the main loop.
 
-`print_mpu6500()` prints one CSV line over **USART1** (HC-05) with the IMU values *after* the project's filtering. It also prints a header line on the first call and every 50 lines. Columns: `MPU,t_ms,pitch,roll,yaw,gx,gy,gz,ax,ay,az,nhiet,dy,nghieng,vz,rung,nhac`. The last four are the lift detector's `lift_tilt_deg`, `lift_vz_ms`, `lift_acc_dev` (in mg) and `robot_lifted`, for tuning its thresholds. `yaw` is printed wrapped to [0, 360) by `MPU6500_Wrap360`; per the user, nothing above 360 is printed. `yaw_angle` itself is deliberately **never wrapped**: `Turn_Angle(3600)`, `Rectangle_Test`'s absolute targets and `Gyro_Spin_Calibrate` need a continuous angle, and wrapping would make the heading error jump about 360° at the 0/360 crossing. Use `MPU6500_YawWrapped()` for display or N/E/S/W.
+`print_mpu6500()` prints one CSV line over **USART1** (HC-05) with the IMU values *after* the project's filtering. It also prints a header line on the first call and every 50 lines. Columns: `MPU,t_ms,pitch,roll,yaw,gx,gy,gz,ax,ay,az,nhiet,dy,nghieng,vz,rung,nhac`. The last four are the lift detector's `lift_tilt_deg`, `lift_vz_ms`, `lift_acc_dev` (in mg) and `robot_lifted`, for tuning its thresholds. `yaw` is printed wrapped to [0, 360) by `MPU6500_Wrap360`; per the user, nothing above 360 is printed. `yaw_angle` itself is deliberately **never wrapped**: `Turn_Angle(3600)`, `Rectangle_Test`'s absolute targets and `Gyro_Spin_Calibrate` need a continuous angle, and wrapping would make the heading error jump about 360° at the 0/360 crossing. Use `MPU6500_Wrap360(yaw_angle)` for display or N/E/S/W.
 - `pitch`/`roll` come from the complementary filter;
 - `yaw` is held while still;
 - `gx`/`gy` are offset-corrected;
@@ -550,7 +671,7 @@ Measured tuning data (30 mm wheels):
     - It returns HAL_TIMEOUT. Like HAL_BUSY, that means the robot starts as lifted and recalibrates itself once set down still.
     - Sim (`MODE=CAL`): still 1.7 s OK, bumped 1.7 s TIMEOUT (one attempt), stuck bus 3.0 s TIMEOUT.
   - `MPU6500_Setup` returns HAL_BUSY/HAL_TIMEOUT when calibration never got a still reading. The robot then starts as **lifted**: motors are locked and the PB15 LED stays off until it has been set down and is still. The IMU still runs, and the Z offset corrects itself at the next standstill.
-- **Wheel geometry:** distance comes from the per-wheel *effective* diameters `WHEEL_DIAMETER_L`/`_R` and `ENCODER_CPR` (700 counts per wheel revolution), which give `MM_PER_COUNT_L`/`_R`. `WHEEL_DIAMETER` and `MM_PER_COUNT` are the averages and are only used for printing.
+- **Wheel geometry:** distance comes from the per-wheel *effective* diameters `WHEEL_DIAMETER_L`/`_R` and `ENCODER_CPR` (700 counts per wheel revolution), which give `MM_PER_COUNT_L`/`_R`.
   - Values measured on 2026-10-09: 29.24/29.03 mm. The nominal 30 mm tires compress under the robot: 1 m by encoder was really about 970 mm. With the gyro holding heading, the encoders showed the right wheel about 0.72% smaller.
   - The L/R values came from (encoder heading − gyro heading)·W / distance, split evenly so the mean is kept. The mean needs a tape-measured distance.
   - `Kf`/`Ka` were rescaled by 30/D per wheel so the feedforward PWM is unchanged.

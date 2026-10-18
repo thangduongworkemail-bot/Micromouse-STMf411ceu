@@ -110,14 +110,11 @@ extern float pitch_angle;                 // Góc ngóc đầu/chúi mũi (độ
 extern float roll_angle;                  // Góc lật nghiêng xe (độ)
 extern float yaw_angle;                   // Góc đã quay cộng dồn (độ), KHÔNG quấn (vd 450 = 1 vòng + 90) - điều khiển dùng
 float MPU6500_Wrap360(float deg);         // Quấn góc về [0, 360) - để hiển thị / đổi ra hướng
-float MPU6500_YawWrapped(void);           // Hướng xe 0..360 (= MPU6500_Wrap360(yaw_angle))
-extern volatile float yaw_rate_dps;       // Tốc độ quay quanh Z (độ/s) đã trừ offset, cùng chiều yaw (dương = trái)
+extern volatile float yaw_rate_dps;      // Tốc độ quay quanh Z (độ/s) đã trừ offset, cùng chiều yaw (dương = trái)
 extern volatile int16_t imu_raw[7];       // Mẫu thô mới nhất: ax, ay, az, nhiệt, gx, gy, gz
 extern volatile uint32_t imu_sample_count; // Tăng 1 mỗi mẫu IMU xử lý xong
 extern float gyro_x_offset, gyro_y_offset, gyro_z_offset;
-extern int16_t Accel_X_RAW, Accel_Y_RAW, Accel_Z_RAW;   // Từ MPU6500_Read_All()
-extern int16_t Gyro_X_RAW,  Gyro_Y_RAW,  Gyro_Z_RAW;
-extern volatile uint8_t imu_ready;        // 1: ngắt TIM9 đang đọc IMU bằng DMA
+extern volatile uint8_t imu_ready;       // 1: ngắt TIM9 đang đọc IMU bằng DMA
 extern volatile uint8_t imu_still;        // 1: xe đang đứng yên (yaw giữ nguyên, offset Gz đang tự chỉnh)
 extern uint8_t mpu_whoami;                // Đọc lúc khởi tạo: 0x70 MPU6500, 0x71 lõi MPU9250
 extern volatile uint8_t robot_lifted;     // 1: xe đang bị nhấc lên (động cơ bị khóa), 0: xe trên sàn
@@ -134,8 +131,14 @@ HAL_StatusTypeDef MPU6500_Setup(void);
 // Chỉnh lại offset gyro Z khi xe đứng yên trên sàn (luồng chính, sau khi imu_ready = 1, dùng mẫu DMA):
 // trung bình GYRO_REZERO_SAMPLES mẫu. Bánh quay / bị chạm (nhiễu lớn) thì giữ offset cũ, trả HAL_BUSY
 HAL_StatusTypeDef MPU6500_ZeroGyroZ(void);
-void MPU6500_Read_All(void);              // Đọc kiểu chờ, KHÔNG gọi sau khi imu_ready = 1
-void I2C_ScanAndPrint_CDC(void);
+// Như trên nhưng KHÔNG CHẶN (Mode Manager): Start rồi gọi Poll mỗi vòng lặp tới khi khác GYRO_ZERO_RUNNING.
+// Kết quả như MPU6500_ZeroGyroZ: HAL_OK = offset mới, HAL_BUSY = bánh quay / bị chạm (giữ offset cũ), HAL_TIMEOUT, HAL_ERROR
+#define GYRO_ZERO_RUNNING     0xFFU
+void    MPU6500_ZeroGyroZ_Start(void);
+uint8_t MPU6500_ZeroGyroZ_Poll(void);
+// Bộ phát hiện nhấc xe khác (encoder / IR, mode_manager.c) báo bị nhấc -> trạng thái như gia tốc kế phát hiện.
+// Chỉ gọi trong ngắt TIM9 (cùng mức ưu tiên với ngắt I2C)
+void    MPU6500_ForceLifted(void);
 
 // ===== GỌI TRONG NGẮT =====
 void MPU6500_Tick(void);                  // Ngắt TIM9 mỗi 2ms: ra lệnh đọc 14 byte bằng DMA

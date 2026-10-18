@@ -44,8 +44,8 @@ from tkinter import ttk, filedialog
 N, E, S, W = 0, 1, 2, 3
 DX = (0, 1, 0, -1)
 DY = (1, 0, -1, 0)
-STATE_NAMES = ["IDLE", "DECIDE_PATH", "MOVE_STRAIGHT", "TURN_LEFT", "TURN_RIGHT", "U_TURN", "FINISHED", "ERROR"]
-PHASE_NAMES = ["SEARCH_GOAL (khám phá tới tâm)", "SEARCH_START (khám phá về)", "SPEED_RUN (chạy nhanh)", "DONE (xong)"]
+STATE_NAMES = ["IDLE", "DECIDE_PATH", "MOVE_STRAIGHT", "TURN_LEFT", "TURN_RIGHT", "U_TURN", "FINISHED", "ERROR", "PAUSED (bị nhấc)", "ALIGN (căn tường)", "CHECKPOINT (lưu Flash)"]
+PHASE_NAMES = ["SEARCH_GOAL (khám phá tới tâm)", "SEARCH_START (khám phá về)", "SPEED_RUN (chạy nhanh)", "DONE (xong)", "RETURN (quay về xuất phát)"]
 STATS_NAMES = ["đoạn thẳng", "ô đã đi", "rẽ 90", "quay đầu", "kéo dài", "rút ngắn", "IR dừng sớm", "ô chạy nhanh"]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PORT = "COM8"           # Cổng Bluetooth HC-05 (Outgoing) trên máy này

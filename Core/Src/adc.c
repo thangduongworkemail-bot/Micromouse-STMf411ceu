@@ -89,15 +89,10 @@ uint16_t IR_FL_ToRef(uint16_t fl_raw)
     return IR_Interp(ir_fl_raw, ir_fl_ref, IR_FL_TAB_N, fl_raw);
 }
 uint16_t IR_L_ToRef(uint16_t l_raw)  { return IR_Interp(ir_l_raw, ir_l_ref, IR_L_TAB_N, l_raw); }
-uint16_t IR_FrontLeft(void)          { return IR_FL_ToRef(adc_value[0]); }
-uint16_t IR_FrontRight(void)         { return adc_value[3]; }
-uint8_t  IR_FrontLeftSaturated(void) { return adc_value[0] >= IR_FL_SAT; }
-uint16_t IR_Left(void)               { return IR_L_ToRef(adc_value[1]); }
-uint16_t IR_Right(void)              { return adc_value[2]; }
 
 // ===== LỌC NHIỄU IR (cho điều khiển theo tường) =====
 // Mỗi 2ms (ngắt TIM9, pid.c gọi IR_Tick): trung vị 3 mẫu gần nhất (bỏ gai / mẫu tụt về 0) rồi lọc thông thấp
-// IR_FILT_K (~6ms). Trả về theo thang chuẩn như IR_FrontLeft()... (trễ ~6-8ms, nhiễu còn ~1/3)
+// IR_FILT_K (~6ms). Trả về theo thang chuẩn: IRFL, IRL đã quy đổi theo bảng (trễ ~6-8ms, nhiễu còn ~1/3)
 static uint16_t ir_hist[ADC_IR_CHANNELS][3];
 static uint8_t  ir_hist_i = 0;
 static float    ir_filt[ADC_IR_CHANNELS];

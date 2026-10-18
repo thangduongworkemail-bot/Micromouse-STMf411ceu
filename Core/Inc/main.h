@@ -62,6 +62,7 @@ void CDC_WaitHost(void);
 // In / nhận qua USART1 (HC-05, main.c). Chỉ gọi ở luồng chính
 void UART_Print(const char *str);
 void UART_WaitStart(const char *prompt);  // Chờ nhận 1 ký tự bất kỳ, in prompt mỗi 2s
+int  UART_TryRead(void);                  // 1 ký tự đã nhận, -1 = chưa có (không chờ)
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

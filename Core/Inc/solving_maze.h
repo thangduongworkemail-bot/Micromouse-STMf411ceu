@@ -9,11 +9,15 @@
   *   - Lớp thuật toán: bản đồ tường, flood fill, chọn hướng, gộp ô thẳng, máy trạng thái. Không gọi phần cứng.
   *   - Lớp phần cứng (HW_*): bọc các hàm có sẵn của dự án (pid.c, adc.c, mpu6500.c). Đổi phần cứng chỉ sửa lớp này.
   *
-  * Cách dùng (main.c, xe đặt ở TÂM ô xuất phát, mũi hướng ra lối mở, đứng yên):
-  *     Maze_Init();
-  *     while (1) { if (Maze_Step() == MAZE_STATE_FINISHED) { break; } }
-  * Maze_Step() không chặn khi xe đang chạy thẳng (gọi càng dày càng tốt, không HAL_Delay dài trong vòng lặp);
-  * rẽ / quay đầu / căn tường thì chặn tới khi xong (xe đứng tại chỗ).
+  * Cách dùng: do mode_manager.c điều khiển (xe ở TÂM ô xuất phát, mũi hướng Bắc = ra lối mở, đứng yên):
+  *     MODE 3 (dò mới):   Maze_Init()          -> Maze_Step() lặp tới FINISHED (khám phá xong, về (0,0), nhìn Bắc)
+  *     MODE 1 (dò tiếp):  Maze_ImportMap() + Maze_StartContinue() -> như trên nhưng giữ các vách đã biết
+  *     Chạm đích lúc dò: MAZE_STATE_CHECKPOINT (xe đứng yên) -> người gọi lưu Flash -> Maze_CheckpointDone()
+  *     MODE 2 (chạy nhanh): Maze_StartSpeedRun() -> Maze_Step() lặp tới FINISHED (tới đích)
+  *     Quay về:          Maze_StartReturn()   -> Maze_Step() lặp tới FINISHED (quay 180, về (0,0), nhìn Bắc)
+  * Maze_Step() KHÔNG CHẶN ở mọi trạng thái (đi thẳng, quay, căn tường đều bắt đầu rồi theo dõi): gọi càng dày càng tốt.
+  * Bị nhấc xe -> MAZE_STATE_PAUSED (giữ bản đồ + ô hiện tại); Maze_Resume() -> chạy tiếp từ ô đó.
+  * Gyro: Maze_Init / Maze_StartSpeedRun chỉ lấy hướng hiện tại làm gốc (không đo lại gyro) - người gọi đo trước.
   ******************************************************************************
   */
 #ifndef SOLVING_MAZE_H
@@ -40,8 +44,11 @@
 #ifndef MAZE_MAX_ROUNDS
 #define MAZE_MAX_ROUNDS           3U         /* Số vòng khám phá tối đa (đi tâm + về) trước khi chạy nhanh */
 #endif
-#ifndef MAZE_RUN_START_DELAY_MS
-#define MAZE_RUN_START_DELAY_MS   1000U      /* Đứng chờ ở ô xuất phát trước khi chạy nhanh */
+#ifndef MAZE_RETURN_SPEED_MMS
+#define MAZE_RETURN_SPEED_MMS     300.0f     /* Tốc độ quay về ô xuất phát sau khi chạy nhanh */
+#endif
+#ifndef MAZE_TURN_TIMEOUT_MS
+#define MAZE_TURN_TIMEOUT_MS      4000U      /* Mỗi lần quay tại chỗ tối đa (kẹt bánh -> lỗi) */
 #endif
 #ifndef MAZE_STRAIGHT_TIMEOUT_MS
 #define MAZE_STRAIGHT_TIMEOUT_MS  3000U      /* Mỗi đoạn thẳng tối đa: chừng này + 2 lần thời gian chạy ở tốc độ tối đa */
@@ -86,8 +93,11 @@ typedef enum
     MAZE_STATE_TURN_LEFT,      /* Quay trái 90 độ tại tâm ô */
     MAZE_STATE_TURN_RIGHT,     /* Quay phải 90 độ tại tâm ô */
     MAZE_STATE_U_TURN,         /* Quay đầu 180 độ tại tâm ô */
-    MAZE_STATE_FINISHED,       /* Đã chạy nhanh tới đích */
-    MAZE_STATE_ERROR           /* Không có đường / chuyển động bị hủy (nhấc xe, lệch hướng, quá giờ) */
+    MAZE_STATE_FINISHED,       /* Xong lượt (khám phá xong / tới đích / về tới xuất phát) */
+    MAZE_STATE_ERROR,          /* Không có đường / chuyển động hỏng (lệch hướng, kẹt, quá giờ) */
+    MAZE_STATE_PAUSED,         /* Bị nhấc xe: dừng, giữ bản đồ + ô hiện tại, chờ Maze_Resume() */
+    MAZE_STATE_ALIGN,          /* Căn tường trước (không chặn) trước khi rẽ */
+    MAZE_STATE_CHECKPOINT      /* Đang dò map, vừa chạm đích: xe đứng yên chờ lưu Flash, Maze_CheckpointDone() để đi tiếp */
 } MazeState;
 
 typedef enum
@@ -95,7 +105,8 @@ typedef enum
     MAZE_PHASE_SEARCH_GOAL = 0,  /* Khám phá: xuất phát -> tâm (tường chưa biết coi như mở) */
     MAZE_PHASE_SEARCH_START,     /* Khám phá: tâm -> xuất phát */
     MAZE_PHASE_SPEED_RUN,        /* Chạy nhanh: xuất phát -> tâm, chỉ đi qua tường đã biết */
-    MAZE_PHASE_DONE
+    MAZE_PHASE_DONE,
+    MAZE_PHASE_RETURN            /* Quay về: đích -> xuất phát theo đường ngắn nhất đã biết */
 } MazePhase;
 
 /* Thống kê (xem / in sau khi chạy) */
@@ -113,7 +124,18 @@ typedef struct
 } MazeStats;
 
 /* ===== API ===== */
-void      Maze_Init(void);             /* Xóa bản đồ, xe ở (0,0) hướng Bắc, lấy hướng gyro hiện tại làm gốc */
+void      Maze_Init(void);             /* Dò map mới (MODE 3): xóa bản đồ, xe ở (0,0) hướng Bắc, khám phá */
+void      Maze_StartContinue(uint8_t x, uint8_t y, uint8_t h);  /* Dò tiếp (MODE 1): GIỮ bản đồ, xe ở ô (x,y) hướng h */
+bool      Maze_IsExplored(void);       /* Đường ngắn nhất đã chắc chắn (chỉ qua cạnh đã biết = lạc quan): hết cần dò */
+void      Maze_CheckpointDone(void);   /* Đã lưu xong ở MAZE_STATE_CHECKPOINT: đi tiếp */
+void      Maze_ExportMap(uint8_t out[MAZE_CELLS]);       /* Chép bản đồ RAM ra (byte ô x*MAZE_SIZE+y) */
+bool      Maze_ImportMap(const uint8_t in[MAZE_CELLS]);  /* Nạp bản đồ vào RAM. false: dữ liệu sai (giữ bản đồ cũ) */
+bool      Maze_HasPath(void);          /* Đã có đường ngắn nhất xuất phát -> đích CHỈ qua cạnh đã biết */
+bool      Maze_StartSpeedRun(void);    /* MODE 2: xe ở (0,0) hướng Bắc, chạy nhanh tới đích. false: chưa có đường */
+void      Maze_StartReturn(void);      /* Đang ở đích: quay 180 rồi chạy đường ngắn nhất về (0,0) */
+void      Maze_Pause(void);            /* Dừng lượt đang chạy (bị nhấc): chốt ô hiện tại, giữ bản đồ */
+void      Maze_Resume(void);           /* Chạy tiếp từ ô đã chốt (xe phải được đặt lại đúng ô, đúng hướng) */
+void      Maze_GetPose(uint8_t *x, uint8_t *y, uint8_t *h);   /* Ô + hướng hiện tại (0 Bắc 1 Đông 2 Nam 3 Tây) */
 MazeState Maze_Step(void);             /* 1 bước máy trạng thái - gọi lặp trong while(1) */
 MazeState Maze_GetState(void);
 MazePhase Maze_GetPhase(void);

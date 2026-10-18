@@ -18,16 +18,12 @@ extern I2C_HandleTypeDef hi2c1;           // main.c (CubeMX)
 
 // gyro và gia tốc accel
 static uint8_t imu_rx_buffer[14];         // DMA ghi vào đây, phải là biến toàn cục/static
-int16_t Accel_X_RAW = 0, Accel_Y_RAW = 0, Accel_Z_RAW = 0;
-  int16_t Gyro_X_RAW = 0,  Gyro_Y_RAW = 0,  Gyro_Z_RAW = 0;
-  float Ax, Ay, Az;
-    float Gx, Gy, Gz;
-    float gyro_x_offset = 0.0f;
-    float gyro_y_offset = 0.0f;
-    float gyro_z_offset = 0.0f;
-    float pitch_angle = 0.0f; // Góc ngóc đầu/chúi mũi
-    float roll_angle = 0.0f;  // Góc lật nghiêng xe
-    float yaw_angle = 0.0f;
+float gyro_x_offset = 0.0f;
+float gyro_y_offset = 0.0f;
+float gyro_z_offset = 0.0f;
+float pitch_angle = 0.0f;                 // Góc ngóc đầu/chúi mũi
+float roll_angle = 0.0f;                  // Góc lật nghiêng xe
+float yaw_angle = 0.0f;
 volatile float yaw_rate_dps = 0.0f;       // Tốc độ quay Z mới nhất (độ/s), dương = quay trái
 volatile int16_t imu_raw[7];              // Mẫu thô mới nhất (thứ tự như 14 byte từ 0x3B)
 volatile uint32_t imu_sample_count = 0;
@@ -79,54 +75,13 @@ static volatile uint8_t    imu_stat_active = 0;
 static char msg[256];                     // Bộ đệm in USB của module này
 
 // ===== KHỞI ĐỘNG =====
-// Tìm Địa Chỉ
-void I2C_ScanAndPrint_CDC(void) {
-    HAL_StatusTypeDef result;
-    uint8_t count = 0;
-
-    CDC_Print("\r\n===============================\r\n");
-    CDC_Print("   Bat dau quet bus I2C...\r\n");
-    CDC_Print("===============================\r\n");
-
-    // Dải địa chỉ I2C 7-bit tiêu chuẩn từ 0x01 đến 0x77 (1 đến 119)
-    for (uint8_t addr_7bit = 1; addr_7bit < 128; addr_7bit++) {
-        // Địa chỉ đưa vào HAL cần dịch trái 1 bit (addr_7bit << 1)
-        result = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr_7bit << 1), 2, 5);
-
-        if (result == HAL_OK) {
-            // Định dạng chuỗi in ra địa chỉ Hex
-            snprintf(msg, sizeof(msg),
-                     "[+] Tim thay thiet bi tai dia chi: 0x%02X\r\n", addr_7bit);
-            CDC_Print(msg);
-
-            // Kiểm tra xem có đúng là MPU-6500 hay không
-            if (addr_7bit == 0x68 || addr_7bit == 0x69) {
-                snprintf(msg, sizeof(msg),
-                         "    -> Co the la MPU6500 (AD0=%s)\r\n",
-                         (addr_7bit == 0x68) ? "GND" : "VCC");
-                CDC_Print(msg);
-            }
-
-            count++;
-        }
-    }
-
-    if (count == 0) {
-        CDC_Print("[-] Khong tim thay thiet bi nao tren bus I2C!\r\n");
-    } else {
-        snprintf(msg, sizeof(msg),
-                 "[*] Hoan thanh! Tong so thiet bi tim thay: %d\r\n", count);
-        CDC_Print(msg);
-    }
-    CDC_Print("===============================\r\n\r\n");
-}
 // khởi tạo MPU6500
 HAL_StatusTypeDef MPU6500_Init(void) {
     uint8_t data[2];
     HAL_StatusTypeDef status;
 
     // 1. Thoát Sleep Mode, dùng PLL trục Gyro X làm clock reference
-    data[0] = 0x6B; // REG_PWR_MGMT_1
+    data[0] = REG_PWR_MGMT_1;
     data[1] = 0x01;
     status = HAL_I2C_Master_Transmit(&hi2c1, MPU6500_ADDR, data, 2, 100);
     if (status != HAL_OK) return status;
@@ -138,20 +93,20 @@ HAL_StatusTypeDef MPU6500_Init(void) {
 
     // 2. DLPF GYRO = GYRO_DLPF_CFG (3: băng thông 41Hz, trễ ~5.9ms) - lý do chọn xem mpu6500.h
     // MPU6500: thanh ghi này CHỈ lọc gyro (khác MPU6050 lọc cả accel) -> accel lọc riêng ở bước 4b
-    data[0] = 0x1A; // REG_CONFIG
+    data[0] = REG_CONFIG;
     data[1] = GYRO_DLPF_CFG;
     status = HAL_I2C_Master_Transmit(&hi2c1, MPU6500_ADDR, data, 2, 100);
     if (status != HAL_OK) return status;
 
     // 3. Tốc độ lấy mẫu (Sample Rate) = 1kHz / (1 + 1) = 500 Hz
     // Khớp với ngắt TIM9 đọc IMU mỗi 2ms -> mỗi lần đọc là 1 mẫu mới, không đọc lặp mẫu cũ
-    data[0] = 0x19; // REG_SMPLRT_DIV
+    data[0] = REG_SMPLRT_DIV;
     data[1] = 0x01;
     status = HAL_I2C_Master_Transmit(&hi2c1, MPU6500_ADDR, data, 2, 100);
     if (status != HAL_OK) return status;
 
     // 4. Accel Full Scale: ±2g -> Độ nhạy 16384 LSB/g (Xe chạy mặt phẳng không cần lớn)
-    data[0] = 0x1C; // REG_ACCEL_CONFIG
+    data[0] = REG_ACCEL_CONFIG;
     data[1] = 0x00;
     status = HAL_I2C_Master_Transmit(&hi2c1, MPU6500_ADDR, data, 2, 100);
     if (status != HAL_OK) return status;
@@ -165,7 +120,7 @@ HAL_StatusTypeDef MPU6500_Init(void) {
 
     // 5. Gyro Full Scale: ±2000 deg/s -> Độ nhạy 16.4 LSB/(deg/s)
     // BẮT BUỘC dùng thang đo lớn nhất vì Micromouse xoay rất gắt
-    data[0] = 0x1B; // REG_GYRO_CONFIG
+    data[0] = REG_GYRO_CONFIG;
     data[1] = 0x18;
     status = HAL_I2C_Master_Transmit(&hi2c1, MPU6500_ADDR, data, 2, 100);
     if (status != HAL_OK) return status;
@@ -253,25 +208,6 @@ HAL_StatusTypeDef MPU6500_Setup(void)
     HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, robot_lifted ? LED_RUN_OFF : LED_RUN_ON);
     imu_ready  = 1;
     return status;
-}
-void MPU6500_Read_All(void) {
-    uint8_t buffer[14];
-    HAL_StatusTypeDef status;
-
-    // Đọc liên tiếp 14 byte từ địa chỉ 0x3B (ACCEL_XOUT_H)
-    status = HAL_I2C_Mem_Read(&hi2c1, MPU6500_ADDR, 0x3B, I2C_MEMADD_SIZE_8BIT, buffer, 14, 100);
-
-    if (status == HAL_OK) {
-        Accel_X_RAW = (int16_t)((buffer[0] << 8) | buffer[1]);
-        Accel_Y_RAW = (int16_t)((buffer[2] << 8) | buffer[3]);
-        Accel_Z_RAW = (int16_t)((buffer[4] << 8) | buffer[5]);
-        // buffer[6] và buffer[7] là nhiệt độ (TEMP_OUT)
-        Gyro_X_RAW  = (int16_t)((buffer[8]  << 8) | buffer[9]);
-        Gyro_Y_RAW  = (int16_t)((buffer[10] << 8) | buffer[11]);
-        Gyro_Z_RAW  = (int16_t)((buffer[12] << 8) | buffer[13]);
-    } else {
-        CDC_Print("Loi doc I2C tu MPU6500!\r\n");
-    }
 }
 
 // ===== GỌI TRONG NGẮT =====
@@ -493,29 +429,73 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 }
 // Lỗi bus I2C (NACK, nhiễu làm hỏng xung SCL/SDA...): HAL đã hủy lần đọc DMA và trả I2C về READY,
 // chu kỳ TIM9 sau đọc lại. Chỉ đếm để MPU6500_Test báo cáo.
-HAL_StatusTypeDef MPU6500_ZeroGyroZ(void)
+// Bản KHÔNG CHẶN (luồng chính gọi Poll mỗi vòng lặp; mỗi lần Poll xử lý mẫu DMA mới nhất nếu có)
+static struct {
+    float    sum, sumsq, sum_half;
+    uint32_t n, last, t0;
+    uint8_t  active;
+} gz0;
+void MPU6500_ZeroGyroZ_Start(void)
 {
-    float sum = 0.0f, sumsq = 0.0f, sum_half = 0.0f;
-    uint32_t n = 0, last = imu_sample_count, t0 = HAL_GetTick();
-    if (!imu_ready) return HAL_ERROR;
-    while (n < GYRO_REZERO_SAMPLES && HAL_GetTick() - t0 < GYRO_REZERO_SAMPLES * 2U + 500U) {
-        if (imu_sample_count == last) continue;           // Chờ mẫu DMA mới (2ms/mẫu)
-        last = imu_sample_count;
-        if (fabsf(speed_left_mms) >= STILL_SPEED_MMS || fabsf(speed_right_mms) >= STILL_SPEED_MMS) return HAL_BUSY;
-        float v = imu_raw[6];
-        sum   += v;
-        sumsq += v * v;
-        n++;
-        if (n == GYRO_REZERO_SAMPLES / 2) sum_half = sum;
+    gz0.sum = gz0.sumsq = gz0.sum_half = 0.0f;
+    gz0.n      = 0;
+    gz0.last   = imu_sample_count;
+    gz0.t0     = HAL_GetTick();
+    gz0.active = 1;
+}
+uint8_t MPU6500_ZeroGyroZ_Poll(void)
+{
+    if (!gz0.active || !imu_ready) {
+        gz0.active = 0;
+        return HAL_ERROR;
     }
-    if (n < GYRO_REZERO_SAMPLES) return HAL_TIMEOUT;
-    float mean = sum / n, var = sumsq / n - mean * mean;
+    if (gz0.n < GYRO_REZERO_SAMPLES) {
+        if (HAL_GetTick() - gz0.t0 >= GYRO_REZERO_SAMPLES * 2U + 500U) {   // Mất mẫu IMU quá nhiều
+            gz0.active = 0;
+            return HAL_TIMEOUT;
+        }
+        if (imu_sample_count == gz0.last) return GYRO_ZERO_RUNNING;       // Chưa có mẫu DMA mới (2ms/mẫu)
+        gz0.last = imu_sample_count;
+        if (fabsf(speed_left_mms) >= STILL_SPEED_MMS || fabsf(speed_right_mms) >= STILL_SPEED_MMS) {
+            gz0.active = 0;
+            return HAL_BUSY;
+        }
+        float v = imu_raw[6];
+        gz0.sum   += v;
+        gz0.sumsq += v * v;
+        gz0.n++;
+        if (gz0.n == GYRO_REZERO_SAMPLES / 2) gz0.sum_half = gz0.sum;
+        if (gz0.n < GYRO_REZERO_SAMPLES) return GYRO_ZERO_RUNNING;
+    }
+    gz0.active = 0;
+    float mean = gz0.sum / gz0.n, var = gz0.sumsq / gz0.n - mean * mean;
     if (var > 0.0f && sqrtf(var) / 16.4f > GYRO_CAL_MAX_STD_DPS) return HAL_BUSY;   // Bị chạm / rung
     // Nửa đầu khác nửa sau = đang bị xoay chậm (tay chỉnh xe) -> không đổi offset
-    float drift = (sum_half - (sum - sum_half)) / (GYRO_REZERO_SAMPLES / 2) / 16.4f;
+    float drift = (gz0.sum_half - (gz0.sum - gz0.sum_half)) / (GYRO_REZERO_SAMPLES / 2) / 16.4f;
     if (fabsf(drift) > GYRO_CAL_MAX_DRIFT_DPS) return HAL_BUSY;
     gyro_z_offset = mean;
     return HAL_OK;
+}
+HAL_StatusTypeDef MPU6500_ZeroGyroZ(void)
+{
+    uint8_t r;
+    if (!imu_ready) return HAL_ERROR;
+    MPU6500_ZeroGyroZ_Start();
+    while ((r = MPU6500_ZeroGyroZ_Poll()) == GYRO_ZERO_RUNNING) {
+    }
+    return (HAL_StatusTypeDef)r;
+}
+// Bộ phát hiện khác (Check_Robot_Picked_Up: encoder / IR, mode_manager.c) báo bị nhấc: vào đúng trạng thái "bị nhấc"
+// như gia tốc kế (khóa động cơ, hủy chuyển động, tắt LED PB15). Đặt xuống vẫn do Lift_Update xác nhận (nằm yên ~1s).
+// Gọi trong ngắt TIM9: cùng mức ưu tiên với ngắt I2C (Lift_Update) nên 2 bên không chen ngang nhau
+void MPU6500_ForceLifted(void)
+{
+    if (robot_lifted) return;
+    robot_lifted = 1;
+    lift_cond_t  = 0.0f;
+    Lift_ResetWindow();
+    HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, LED_RUN_OFF);
+    Motion_OnLifted();
 }
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
 {
@@ -532,10 +512,6 @@ float MPU6500_Wrap360(float deg)
     if (w < 0.0f) w += 360.0f;
     if (w >= 360.0f) w = 0.0f;            // -0.00001 + 360 làm tròn float ra đúng 360
     return w;
-}
-float MPU6500_YawWrapped(void)
-{
-    return MPU6500_Wrap360(yaw_angle);
 }
 
 // ===== DEBUG =====
