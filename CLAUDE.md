@@ -12,7 +12,7 @@ Application code is split by subsystem. Each module's header is in `Core/Inc/`:
 |---|---|
 | `main.c` | CubeMX init plus `USER CODE` blocks: `CDC_Print`/`CDC_WaitHost`, the start-up order, the TIM9 dispatcher `HAL_TIM_PeriodElapsedCallback`, and the `while(1)` loop |
 | `main.h` (`USER CODE` EC/EFP) | `CONTROL_DT` (shared 2 ms tick) and the `CDC_Print`/`CDC_WaitHost`/`UART_Print`/`UART_WaitStart` prototypes |
-| `pid.c` / `pid.h` | Motor driver, encoders, velocity PID, the outer motion loop (`Move_Straight`/`Turn_Angle`, encoder distance plus gyro heading), `PID_Test`, `Rectangle_Test`, `Straight_Test`. All tuning and pin/sign config `#define`s live in `pid.h` |
+| `pid.c` / `pid.h` | Motor driver, encoders, velocity PID, the outer motion loop (`Move_Straight`/`Turn_Angle`, encoder distance plus gyro heading), the smooth 90° curve turn (`Smooth_Turn_*`, test-only), `PID_Test`, `Rectangle_Test`, `Straight_Test`. All tuning and pin/sign config `#define`s live in `pid.h` |
 | `mpu6500.c` / `mpu6500.h` | **MPU6500 only**, no MPU6050/9250 code paths, I2C address `MPU6500_ADDR`. IMU init (including a `WHO_AM_I` read into `mpu_whoami`: 0x70 MPU6500, or 0x71 for the MPU9250 die actually fitted) and calibration, DMA read tick, `HAL_I2C_MemRxCpltCallback`, `HAL_I2C_ErrorCallback` (counts I2C errors), angle math, `MPU6500_Test` |
 | `adc.c` / `adc.h` | IR ADC+DMA start, emitters, `adc_value[]`, front and side sensor equalization (`IR_FL_ToRef`, `IR_L_ToRef`), filtered values for control (`IR_Tick`, `IR_*_Filt`) |
 | `solving_maze.c` / `solving_maze.h` | On-robot flood-fill maze solver with continuous straights (see "Maze solver"). Fully non-blocking; driven by `mode_manager.c` |
@@ -137,7 +137,7 @@ Application code sets speeds through two functions:
 
 Both cancel any active motion: they set `motion_mode` to IDLE **before** touching the targets, so the ISR can't overwrite them afterwards. Don't write `target_speed_*` or `motor_pid_enable` directly; only `Motion_Update` inside `pid.c` does.
 
-**Outer motion loop.** `Move_Straight(mm, speed_mms)`, `Turn_Angle(deg)` (positive is left), `Turn_Left` and `Turn_Right` block the main thread until the robot has arrived and stood still for `MOTION_SETTLE_MS`. `speed_mms` is the straight's maximum speed, clamped to `MAX_SPEED_MMS`; `MOVE_SPEED_MMS` (250) is just the default used by `Rectangle_Test` and the examples. They return 0 on any of these:
+**Outer motion loop.** `Move_Straight(mm, speed_mms)`, `Turn_Angle(deg)` (positive is left), `Turn_Left` and `Turn_Right` block the main thread until the robot has arrived and stood still for `MOTION_SETTLE_MS`. `speed_mms` is the straight's maximum speed; `MOVE_SPEED_MMS` (250) is just the default used by `Rectangle_Test` and the examples. Since 2026-10-18 (user request "no speed limit in Move_Straight") a straight is **not clamped to `MAX_SPEED_MMS`**; see "Unlimited straight speed" below. They return 0 on any of these:
 - abort: heading error above `MOTION_ABORT_DEG`, which usually means a wrong `YAW_SIGN` or a collision;
 - timeout after `MOTION_TIMEOUT_MS` plus twice the segment's time at maximum speed, so long distances aren't cut off;
 - motors locked or IMU not ready.
@@ -172,6 +172,41 @@ How it works:
   - At rest the accelerometer reads ax 0.16 / ay 0.15 g. If that is real tilt rather than offset, the tilt is about 10°, which means about 1.5% low and about 5° per 360°. That matches the user's "gyro off 5°" report.
   - To check: rotate the robot by hand while running `print_mpu6500()`. With tilt, gx/gy follow gz at about 15–18% of it; with a flat chip they stay at noise level.
   - Either way `YAW_SCALE` corrects the scale. Remounting the chip flat also removes pitch-to-yaw coupling.
+
+**Smooth 90° curve turn** (2026-10-22, user spec "Smooth_Turn_Left_90/Right_90, three phases, kinematic model, no blocking delay"). It is test-only for now and not yet used by the flood-fill solver.
+- **Structure.** `MOTION_CURVE` runs in `Motion_Update` (TIM9 ISR) through `Curve_Update`.
+  - `Smooth_Turn_Begin(dir, approach_mm, exit_mm, v_turn, v_max)` is non-blocking; follow it with `Motion_Status()`.
+  - `Smooth_Turn_Left_90()` / `Smooth_Turn_Right_90()` go from a cell centre through the next cell and stop at the centre of the cell after the turn.
+  - `Smooth_Turn_Test(dir, cells, v_max, print_log)` is blocking. It reports over UART and can dump a 4 ms CSV log (`cv_log`, 600 × 18 B).
+  - Defines are the `CURVE_*` block in `pid.h`.
+- **The path is parametrised by encoder distance s, not time.** Curvature is κ(s) = (π/L)·sin²(πs/L), totalling exactly 90°. Curvature and its rate are both continuous, so wheel acceleration has no steps (a trapezoid/clothoid profile would have them).
+  - Reference heading θ(s) = h0 ± (π/2·u − sin(2πu)/4). It is continuous through all three phases, so there is no ω jump arc→straight, and it ends exactly at h0 ± 90 (absolute; yaw is never reset).
+  - ω = κ(s)·v_ref (the ramped centre ref) + PD on (θ_ref + lateral correction − gyro heading); D is taken against the equally filtered ω_ff.
+  - Wheels: v ∓ ω·b/2 into the existing velocity PID and ramp; PWM is never set directly.
+- **Lateral correction.**
+  - Approach: the usual wall centring.
+  - Arc and early exit: odometry (encoder ds × gyro heading) versus the reference path integrated over the same s, with `CURVE_LAT_KP_DEG_PER_MM` 0.5, ±5°.
+  - After `CURVE_EXIT_BLEND_MM`: wall centring again, if side walls are present.
+- **Encoder versus gyro.** The heading-difference cross-check over the arc is reported, and flags slip, a wrong `YAW_SCALE` or a wrong `TRACK_WIDTH_MM`. In the sim a ±2% gyro gain gave ∓1.8°.
+- **Phase A (approach).**
+  - The speed follows √(v_turn² + 2·`MOVE_DECEL_MMS2`·remaining), so it reaches the arc start at exactly v_turn.
+  - The arc start is D before the corner-cell centre, computed by `Curve_D` from the profile, not taken from the cell edge.
+  - At `CURVE_SENSE_BEFORE_MM` (90, uncalibrated) the turn-side eye must read open (< 170). Otherwise there is no turn: the robot stops at the corner centre, or at the front-wall target, with `MOTION_CURVE_BLOCKED` ("HUY CUA").
+  - Optional longitudinal correction from the turn-side wall edge, `CURVE_EDGE_POS_MM` (0 = off until calibrated). The test prints the measured value. Diagonal eyes see the edge only about 2 mm past the centre of the cell before the corner, so use `cells = 2`.
+- **Phase C (exit).** v stays at v_turn until the heading error is < 2° and the lateral error < 3 mm. The cap then rises at `CURVE_EXIT_ACCEL_MMS2` (1000; it jumped straight to the 2000 ramp before). There is a front-wall slow-down/stop as in straights (`MOTION_WALL`, no alignment). Done = distance reached + standstill (the normal settle).
+- **Geometry** (`scratchpad/curve/geom.py`): body 100 × 80 mm, axle 30 mm from the tail, worst-case corner (all closed except entry/exit, inner post).
+  - L 140 gives D 81.8, R_min 44.6, inner wheel +0.15·v, min clearance 21.3 mm (outer front corner).
+  - Below L ≈ 130 the inner wheel must reverse. Above 150, D exceeds the 90 mm sense point.
+  - v_turn is automatic: min(outer wheel ≤ 450, a_lat ≤ 3000 mm/s², wheel accel from dκ/ds ≤ 1500). That gives about 243 mm/s, limited by the outer wheel (1.85·v).
+- **Sim** (`scratchpad/wall_sim2`, `MODE=CURVE`, corner walls ray-cast, 45° side eyes calibrated to 240/280):
+  - left/right turns, v_max 300/400, a 4% weak wheel and side-looking eyes all ended within 1.6 mm and ±0.15° of the target cell centre, with ≥ 23 mm clearance and max heading error ≤ 0.65°;
+  - gyro gain ±2% gives ±2.1° (calibration); a start offset of 10 mm / 3° or wheel diameter ±2% still leaves ≥ 19 mm clearance;
+  - BLOCK gives "HUY CUA" at the corner; an exit wall gives a stop at IR 1700;
+  - edge correction with a 2-cell approach and start errors of −20…+10 mm ends within 0.6 mm (without it, the error carries through and clearance drops to 13 mm);
+  - wheel acceleration (10 ms average): arc 1204, exit 1249 mm/s² (straight-line baseline 92);
+  - the 15 old wall scenarios are unchanged.
+
+  **Not tested on hardware; the traction limit (`CURVE_A_LAT_MAX_MMS2`) and the sense/edge positions need measuring.**
 
 **Front IR equalization** (`adc.c`, 2026-10-10): the two front sensors differ a lot.
 - The data: 622 samples from `print_LED` while moving to and from a flat wall with both eyes at the same distance.
@@ -403,7 +438,7 @@ How it works:
     - prints "TAM DUNG (nhac xe: …): dat lai o (x,y) mui huong …" over UART;
     - `Save_Map(FLASH_SAVE_LIFTED)`.
   - **Save points** (`Save_Map`): `Motor_Stop()` first; it exports the map, pose, phase, rounds and the HAS_PATH/EXPLORED flags, then prints "LUU FLASH (…) lan #n … -> OK". Saves happen only when stopped: at the goal and at the end of exploration, on a lift, on an error, and at the start of MODE 3. Never while driving.
-  - **`STATE_PAUSED` → `STATE_RESUME`** needs 5 s (`PAUSE_STILL_MS`) of continuous stillness:
+  - **`STATE_PAUSED` → `STATE_RESUME`** needs `PAUSE_STILL_MS` (3 s since the user changed it on 2026-10-22; was 5 s) of continuous stillness:
     - every IR channel within max(25, 8%) of the snapshot;
     - wheels rolled ≤ 1 mm;
     - `lift_acc_dev` ≤ 4 mg;
@@ -463,11 +498,43 @@ How it works:
   - `partial`: MODE 3 lifted after 10 cells → power cycle → 2 covers rejected ("map do") → 1 cover continues and finishes → 2 covers → correct fast run.
   - 120 competition mazes: 266/270 runs correct (`ui`/`full`/`partial` on the first 30, `full`/`partial` on the next 90), 0 Flash faults. The two failures are `001.txt` and `001-anomaly-test.txt` in `full`/`partial`. The harness's own BFS also finds no path to the goal there; the firmware correctly errors and rejects MODE 2.
 
-**Lift detection** (2026-10-10, user request) is automatic. It runs in `Lift_Update()` at the end of `MPU6500_Process_Data`, in the I2C ISR, using the accelerometer only. The gyro is avoided because a fast turn in place would otherwise look like a tilt whenever the accel reference is misaligned. Thresholds are the `LIFT_*` defines in `mpu6500.h`.
-- **Lifted** when either condition holds for `LIFT_CONFIRM_S` (20 ms):
+**Lift detection** (2026-10-10, user request; reworked 2026-10-22, see below) is automatic. It runs in `Lift_Update()` at the end of `MPU6500_Process_Data`, in the I2C ISR. Thresholds are the `LIFT_*` defines in `mpu6500.h`.
+- **Lifted** when any condition holds **continuously** for `LIFT_CONFIRM_S` (**200 ms** since 2026-10-22; it was 20 ms):
   - tilt > `LIFT_TILT_DEG` (20°). Tilt is the angle between the accel vector, low-passed with `LIFT_TILT_TAU_S` (0.2 s), and `lift_ref`, the accel direction captured while resting on the floor.
-  - |vertical velocity| > `LIFT_VZ_MS` (0.12 m/s). This is the leaky integral (τ `LIFT_VZ_TAU_S`) of the accel component along `lift_ref` minus its rest magnitude.
-- On lift it sets `robot_lifted`, turns PB15 off and calls `Motion_OnLifted()`. That cancels the motion (the waiting function returns 0 with `MOTION_LIFTED`, "HUY: xe bi nhac len"), disables the PID and brakes.
+  - |vertical velocity| > `LIFT_VZ_MS` (0.12 m/s). This is the leaky integral (τ `LIFT_VZ_TAU_S`) of the accel component along `lift_ref` minus its rest magnitude. A vertical jolt > `LIFT_VZ_SHOCK_G` (0.5 g) zeroes vz for `LIFT_VZ_SHOCK_S` (0.1 s): a hand never accelerates the robot that hard, but a floor seam or a collision does.
+  - tilt rate `lift_tilt_rate_dps` > `LIFT_TILT_RATE_DPS` (30 °/s). It is |ω·e1| + |ω·e2|, where e1/e2 are horizontal axes built from `lift_ref` (`Lift_SetBasis`), not the chip axes. It only counts while the rate about the vertical (ω·`lift_ref`) is < `LIFT_TILT_RATE_YAW_DPS` (80 °/s). Without this gate, a 300 °/s in-place turn leaks 50–80 °/s into the tilt rate, either from a ~10° chip tilt or from a `lift_ref` skewed by accel offsets; in the sim it reached 82 °/s.
+- **Lock** (`Lift_Lock(state)`, shared by lift, crash and `MPU6500_ForceLifted`): sets `robot_lifted` and `imu_state` (`IMU_STATE_PICKED_UP` / `IMU_STATE_CRASHED`; `IMU_STATE_NORMAL` after set-down; boot without a good calibration = PICKED_UP), turns PB15 off and calls `Motion_OnLifted()`. That cancels the motion (the waiting function returns 0 with `MOTION_LIFTED`, "HUY: xe bi nhac len"), disables the PID and brakes.
+- **Crash detection** (2026-10-22, user spec "jerk-based crash detection"). It is `Crash_Update()`, called from `Lift_Update`, using the `CRASH_*` defines.
+  - Each channel (ax, ay, az, Gz) goes through a median of 3 first. A single corrupted I2C sample makes two consecutive jerk spikes (up, then back), so a "2 consecutive cycles" rule alone can't reject it.
+  - Then jerk = change over `CRASH_LAG_SAMPLES` (5 = 10 ms). planar = |Δa·e1| + |Δa·e2| (horizontal, gravity frame), gz jerk = |ΔGz|.
+  - Frontal: planar > `CRASH_JERK_G` 1.10 g. Glancing: planar > `CRASH_JERK_SIDE_G` 0.73 g **and** gz jerk > `CRASH_GZ_JERK_DPS` 76 °/s. The user's numbers were 18000/12000 LSB at ±2 g and 10000 LSB written for a ±250 °/s gyro. This gyro is ±2000 °/s (16.4 LSB per °/s), so that last one is 1250 LSB here.
+  - Must hold `CRASH_CONFIRM_N` (2) consecutive samples, and only while `motor_pid_enable` is set. Then `Lift_Lock(IMU_STATE_CRASHED)`.
+  - Recovery is the same as set-down below; the Mode Manager pauses with "TAM DUNG (VA CHAM)" (`PICKUP_BY_CRASH`) and resumes after `PAUSE_STILL_MS`.
+  - **Not validated on hardware.** Tune with the `giat`/`giatz` columns of `print_mpu6500`.
+- **Accel range is ±8 g since 2026-10-22** (`ACCEL_FS_CFG` 0x10, `ACCEL_LSB_PER_G` 4096; every conversion uses the define). With the chip upside down, Z rests at −1.17 g, so ±2 g left only 0.83 g of headroom. Seam jolts were clipped one-sided inside the chip, before the DLPF, which biased vz. In the sim that caused false lifts at 0.3–2 mm seams. The 0.5 g shock gate can't see it, because the 20 Hz DLPF output stays below 0.5 g.
+- **Spec items deliberately not taken** (the user's 2026-10-22 spec):
+  - fixed az windows such as |az − 16384| > 5500 and 14500 < az < 18200. With this chip, az rests at −1.17 g, so the robot would be "lifted" forever and could never resume;
+  - gyro thresholds in ±250 °/s LSB;
+  - the gyro-only pickup rule. It is replaced by the gated tilt rate described above.
+
+  Resume uses the existing set-down conditions plus the Mode Manager's `PAUSE_STILL_MS` (the user set it to 3000), which already restart on any disturbance.
+- **IMU sim** (`scratchpad/wall_sim2`, `MODE=IMU SC=drive|seam|spike|crash|glance|lift`).
+  - Model: a 3-axis accel from the real wheel motion; the board's rest reading (0.16, 0.15, −1.17) g as offsets; clipping at the configured range; a 2-pole 20 Hz DLPF; driving vibration from the hardware std (Ax 51 / Ay 30 / Az 25 mg, Gx 2.4 / Gy 8.6 / Gz 6 °/s at 250 mm/s, scaled with speed).
+  - Optional gyro coupling (`TILT=1`, a 10° tilted chip) and cosine floor seams every 180 mm (`SEAMD` depth, 6 mm long, chip 20 mm above the pitch axis).
+  - Built with `mpu_wrap.c`, which `#include`s the real `mpu6500.c` to read the statics; `simold.exe` is the pre-change `mpu6500.c`.
+  - Results:
+    - Drive and turns at 300/500 mm/s, with or without `TILT`: no false lift or crash; the condition held ≤ 18 ms; planar ≤ 0.46 g, gz jerk ≤ 60 °/s.
+    - Seams 0.3/0.5/1/2 mm at 300 and 500 mm/s: new 0/8 false lifts (held ≤ 34 ms); old 6/8. With ±2 g and only the 200 ms rule, 1 mm @300 and 0.5–1 mm @500 still false-lifted.
+    - Seam planar jerk reached 0.89 g at 2 mm.
+    - A single-sample spike (ax +20000 LSB, gz +2000 LSB): no crash.
+    - Lift with tilt: detected at 202 ms (old ~90 ms); level lift at 270 ms; a slow level lift (0.05 g) is not detected, by either version. The robot unlocks 1.4 s after release.
+  - Crash with the user's thresholds:
+    - frontal at 150/300/500 mm/s with 10 ms contact gave planar 0.51/1.02/1.69 g, so only 500 mm/s was detected;
+    - with 20 ms contact: 0.34/0.69/1.13 g;
+    - glancing (30% Δv, yaw kick 80–300 °/s) gave planar 0.55 g with gz jerk 96–310 °/s, so it is not detected (the planar part is too small).
+
+    At maze speeds these thresholds will likely rarely fire; tune them on hardware.
+  - The 15 earlier wall scenarios are unchanged. `mm_sim` scenario `crash` paused with "TAM DUNG (VA CHAM)", resumed 3.3 s later and finished exploring; 120/120 across 30 mazes × (crash/ui/full/partial).
 - While lifted, three guards keep the motors off:
   - `Motor_SetPWM` forces 0;
   - `Motor_SetSpeed` calls `Motor_Stop` and returns;
@@ -488,7 +555,7 @@ How it works:
   - `yaw_angle` = 0, so the initial angle is the angle at set-down;
   - PB15 turns on;
   - `Motion_OnPlaced()` sets `heading_target` and resets the odometry origin.
-- Interrupted motions do not resume by themselves. The Mode Manager pauses an interrupted maze run and resumes it after the robot is put back and stays still for 5 s (see "Mode Manager + Safety").
+- Interrupted motions do not resume by themselves. The Mode Manager pauses an interrupted maze run and resumes it after the robot is put back and stays still for `PAUSE_STILL_MS` (3 s) (see "Mode Manager + Safety").
 - **Sim** (`scratchpad/lift_sim`): the real code, a 3-axis IMU with the board's (0.16, 0.15, −1.17) g rest reading modelled both as accel offsets and as a ~10° chip tilt, driving vibration, centripetal force at 35 mm from the axle, and hand tremor.
   - No false lift during driving at 350 mm/s, 180° turns, a hard brake from 350, hitting a wall at 300, hold mode with hand rotation on the floor, or a 4 s spin. Worst cases were tilt 6.7° and |vz| 0.054 m/s.
   - A lift is detected in 70–110 ms.
@@ -551,7 +618,13 @@ To fix the wheel direction, flip `MOTOR_*_SIGN`; to fix the encoder direction, f
 
 The `print_LED()`, `print_mpu6500()` and `print_SpeedPID()` helpers are debug output, meant to be called by hand from the main loop.
 
-`print_mpu6500()` prints one CSV line over **USART1** (HC-05) with the IMU values *after* the project's filtering. It also prints a header line on the first call and every 50 lines. Columns: `MPU,t_ms,pitch,roll,yaw,gx,gy,gz,ax,ay,az,nhiet,dy,nghieng,vz,rung,nhac`. The last four are the lift detector's `lift_tilt_deg`, `lift_vz_ms`, `lift_acc_dev` (in mg) and `robot_lifted`, for tuning its thresholds. `yaw` is printed wrapped to [0, 360) by `MPU6500_Wrap360`; per the user, nothing above 360 is printed. `yaw_angle` itself is deliberately **never wrapped**: `Turn_Angle(3600)`, `Rectangle_Test`'s absolute targets and `Gyro_Spin_Calibrate` need a continuous angle, and wrapping would make the heading error jump about 360° at the 0/360 crossing. Use `MPU6500_Wrap360(yaw_angle)` for display or N/E/S/W.
+`print_mpu6500()` prints one CSV line over **USART1** (HC-05) with the IMU values *after* the project's filtering. It also prints a header line on the first call and every 50 lines. Columns: `MPU,t_ms,pitch,roll,yaw,gx,gy,gz,ax,ay,az,nhiet,dy,nghieng,vz,rung,nhac,lat,giat,giatz,tt`.
+- `nghieng`/`vz`/`rung`/`nhac` are the lift detector's `lift_tilt_deg`, `lift_vz_ms`, `lift_acc_dev` (in mg) and `robot_lifted`.
+- `lat` is `lift_tilt_rate_dps`.
+- `giat`/`giatz` are the largest planar jerk (g) and Gz jerk (°/s) since the previous line; reading them resets them.
+- `tt` is `imu_state`.
+
+Use these columns to tune the lift and crash thresholds. `yaw` is printed wrapped to [0, 360) by `MPU6500_Wrap360`; per the user, nothing above 360 is printed. `yaw_angle` itself is deliberately **never wrapped**: `Turn_Angle(3600)`, `Rectangle_Test`'s absolute targets and `Gyro_Spin_Calibrate` need a continuous angle, and wrapping would make the heading error jump about 360° at the 0/360 crossing. Use `MPU6500_Wrap360(yaw_angle)` for display or N/E/S/W.
 - `pitch`/`roll` come from the complementary filter;
 - `yaw` is held while still;
 - `gx`/`gy` are offset-corrected;
@@ -640,7 +713,24 @@ Measured tuning data (30 mm wheels):
   - Remaining "Vot_lo" of 10–18% and left 0→200 `t_od` of up to 142 ms are single-count spikes, not real overshoot.
   - Steady PWM is left 1094 @ 200, 1615 @ 300, −841 @ −150 and right 1157 / 1683 / −897. The integrator covers the remaining 0–65 PWM of feedforward error.
   - Mean |ΔPWM| per tick is 11–57, with a maximum of about 104.
-- `MAX_SPEED_MMS` = 350 is a leftover limit from the old forward drive. The linear map suggests about 450–500 mm/s with headroom left for Ka and the PID, but raise it only after testing at around 400.
+- `MAX_SPEED_MMS` = 350 is a leftover limit from the old forward drive. It now only limits `Motor_SetSpeed`, turns and HOLD; straights ignore it (see "Unlimited straight speed").
+- **Unlimited straight speed** (2026-10-18). `Move_Straight`/`Move_Straight_Begin` no longer clamp `speed_mms`, and in `MOTION_STRAIGHT` the wheel targets aren't clamped either. Simply removing the clamp failed in the full-robot sim (`scratchpad/wall_sim2`, motor model saturating at about 554 mm/s at `PWM_MAX`):
+  - at 1000 mm/s both wheels sat at `PWM_MAX` for 4.2 s, leaving no speed difference for steering. The robot drifted 43 mm sideways into the side wall;
+  - against a front wall it crashed (IR 6080), because `Wall_SpeedLimit` built its braking curve from the commanded 1000 instead of the ~554 actually reached.
+
+  Two guards were added, and both stay inactive at ≤ `MAX_SPEED_MMS`:
+  - `Straight_SpeedCeiling()` runs every tick in a straight. If either |PWM| ≥ `PWM_MAX` − `STRAIGHT_PWM_HEADROOM` (200), the ceiling drops to the measured centre speed, but never below `MAX_SPEED_MMS`. Otherwise the ceiling rises back toward `speed_mms` at `STRAIGHT_VLIM_RISE_MMS2` (300 mm/s², so Ka adds little). The top speed therefore follows the battery and motors.
+  - `Wall_SpeedLimit` uses max(`MAX_SPEED_MMS`, `straight_vpeak`, the highest ramped ref of this straight) as v_max when `speed_mms` > `MAX_SPEED_MMS`, and only once front > `WALL_SLOW_IR`. A first version applied it with no wall in view, which locked every straight at 350.
+  - The `Straight_Prepare` timeout uses min(speed, `MAX_SPEED_MMS`), so slower-than-commanded straights aren't cut off.
+
+  Sim results:
+  - Corridor at 1000 or 3000 mm/s: about 504 mm/s with no PWM saturation, |Y| 0.2 mm. A 4% weaker right wheel gives about 496 mm/s. Starting 20 mm and 3° off centres the same as at 350.
+  - Front wall at 500/1000/3000 from 150/500/1500 mm, and ENDWALL: all return 2, Imax ≤ 1786, nose gap 14.5 mm.
+  - Headroom 100/200/300 gives 521/504/487 mm/s with equal steering. 200 was chosen because it exceeds the measured per-tick PWM jitter (max about 104).
+  - Regression across 15 scenarios at 250–350: identical except the exact-350 cases (±0.2°, ±0.5 mm), where the old clamp also cut the faster wheel's steering.
+  - CORRIDOR (the user's loop, return leg @400, previously clipped to 350): 3.15 s instead of 3.44 s, all ret=2.
+
+  Not tested on hardware. The front-wall braking room between `WALL_SLOW_IR` and the target grows as v² (see Walls), and turns in the maze need v ≤ about 420 for `MAZE_SENSE_BEFORE_MM` 90.
 - The ±12 mm/s jitter in `speed_*_mms` is encoder quantization (4–5 counts per tick, 67 mm/s per count), not real speed variation. Raising Kp amplifies it into PWM jitter, which the motor filters out. It doesn't improve tracking on a healthy wheel, but it does speed up the rejection of load disturbances.
 
 ## Gotchas
@@ -676,7 +766,7 @@ Measured tuning data (30 mm wheels):
   - The L/R values came from (encoder heading − gyro heading)·W / distance, split evenly so the mean is kept. The mean needs a tape-measured distance.
   - `Kf`/`Ka` were rescaled by 30/D per wheel so the feedforward PWM is unchanged.
   - When the wheels physically change, also scale the PID gains and `MAX_SPEED_MMS` by old/new diameter, because the same PWM now produces a different speed in mm/s.
-- **Accelerometer on this board:** at rest on a flat floor it reads ax +0.16, ay +0.15, az −1.17 g, so |a| = 1.19 g instead of 1.00. The chip is mounted upside down (roll ≈ 173°, consistent with `YAW_SIGN` = −1) and has accel offsets of roughly 0.15–0.17 g. Pitch/roll therefore read about 7–8° off. They aren't used for control, so this is harmless for now. If pitch/roll are ever needed, do a 6-position accel offset calibration first.
+- **Accelerometer on this board:** at rest on a flat floor it reads ax +0.16, ay +0.15, az −1.17 g, so |a| = 1.19 g instead of 1.00. Never compare az to a fixed +1 g window (e.g. 16384 LSB): compare against `lift_ref`. The range is ±8 g (`ACCEL_LSB_PER_G` 4096) since 2026-10-22, so convert raw values with the define, not with 16384. The chip is mounted upside down (roll ≈ 173°, consistent with `YAW_SIGN` = −1) and has accel offsets of roughly 0.15–0.17 g. Pitch/roll therefore read about 7–8° off. They aren't used for control, so this is harmless for now. If pitch/roll are ever needed, do a 6-position accel offset calibration first.
 - **Hardware results from the removed `Straight_IMU_Test` (2026-10-09):**
   - UART/Bluetooth has no effect: 0 encoder pulses while transmitting, IMU noise ×0.9–1.1, TIM9 period 1995.9–2000.2 µs, `Motor_Speed_Tick` at most 38 µs (1.9% CPU).
   - Driving at 250 mm/s versus standing still, std ratios: Gz ×95–100 (about 6 °/s), Gx ×40, Gy ×155 (8.6 °/s, the robot pitches), Ax 51 mg, Az 22–28 mg.

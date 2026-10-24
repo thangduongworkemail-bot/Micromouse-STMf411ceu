@@ -28,6 +28,12 @@
 #define GYRO_DLPF_CFG         0x03
 // Accel ~20Hz: accel chỉ dùng neo pitch/roll (thay đổi rất chậm) -> lọc mạnh không mất gì, giảm rung lọt vào
 #define ACCEL_DLPF_CFG        0x04
+// Dải đo accel (ACCEL_CONFIG): 0x00 ±2g 16384 LSB/g | 0x08 ±4g 8192 | 0x10 ±8g 4096 | 0x18 ±16g 2048.
+// ±8g từ 22/10/2026 (trước ±2g): chip lắp úp, nằm yên trục Z đã -1.17g -> ±2g chỉ còn 0.83g tới giới hạn, cú xóc qua gờ
+// sàn / va chạm bị cắt 1 phía NGAY TRONG CHIP (trước DLPF) -> vận tốc đứng lệch giả (báo nhấc nhầm), độ giật va chạm bị
+// cụt. ±8g còn ~6.8g; độ phân giải 0.24mg vẫn nhỏ hơn nhiễu chip
+#define ACCEL_FS_CFG          0x10
+#define ACCEL_LSB_PER_G       4096.0f
 // Bộ lọc bù pitch/roll: hằng số thời gian (s). Alpha cũ 0.96 ~ 0.05s: xe tăng tốc 2000mm/s2 (0.2g)
 // là pitch sai ~11 độ; 0.5s thì gia tốc ngắn của xe gần như không làm lệch góc
 #define ANGLE_COMP_TAU_S      0.5f
@@ -81,11 +87,16 @@
 //   chặn Motor_SetSpeed / Motor_SetPWM, TẮT LED PB15.
 // ĐẶT XE XUỐNG, nằm yên LIFT_PLACE_S: chỉnh lại offset gyro 3 trục, yaw = 0 (góc ban đầu = góc lúc đặt xuống),
 //   gốc vị trí + hướng đích = chỗ đặt, BẬT LED PB15 = xe sẵn sàng hoạt động.
-// Nhận biết nhấc chỉ bằng GIA TỐC KẾ (không dùng gyro: quay tại chỗ nhanh không bị nhầm là bị nhấc):
+// Nhận biết nhấc (22/10/2026: thêm tốc độ lật + duy trì 200ms theo yêu cầu người dùng), 1 trong 3 dấu hiệu:
 //   - nghiêng: hướng trọng lực (accel lọc LIFT_TILT_TAU_S) lệch hướng lúc nằm trên sàn > LIFT_TILT_DEG
 //     (xe chạy trên sàn: tăng/giảm tốc, va tường chỉ làm lệch < ~10 độ)
-//   - hoặc nâng thẳng lên: vận tốc theo phương thẳng đứng (tích phân gia tốc, rò LIFT_VZ_TAU_S) > LIFT_VZ_MS
-//   liên tục LIFT_CONFIRM_S
+//   - nâng thẳng lên: vận tốc theo phương thẳng đứng (tích phân gia tốc, rò LIFT_VZ_TAU_S) > LIFT_VZ_MS
+//   - tay lật xe: tốc độ quay quanh 2 trục NẰM NGANG (roll + pitch, tính theo hướng trọng lực lúc nằm trên sàn chứ
+//     không theo trục chip - chip có thể lắp nghiêng) |w1| + |w2| > LIFT_TILT_RATE_DPS, chỉ xét khi xe không tự
+//     quay nhanh (|tốc độ quay quanh trục đứng| < LIFT_TILT_RATE_YAW_DPS): chip nghiêng ~10 độ thì quay tại chỗ
+//     300 độ/s làm gx, gy ~74 độ/s -> không chặn thì lần quay nào cũng bị coi là bị nhấc
+//   phải đúng LIÊN TỤC LIFT_CONFIRM_S (200ms): vấp mối ghép sàn chỉ gây giật vài chục ms rồi hết -> bỏ qua, chạy tiếp
+//   (trước đây 20ms: vấp gờ có thể bị nhận nhầm là bị nhấc)
 // Nhận biết đặt xuống: liên tục LIFT_PLACE_S có |gyro| mọi trục < LIFT_PLACE_GYRO_DPS, Gz êm (như nhận biết
 //   đứng yên: gz_dev < STILL_DEV_DPS), độ rung gia tốc < LIFT_PLACE_ACC_DEV_G, 2 bánh đứng yên,
 //   nghiêng < LIFT_PLACE_TILT_DEG. Tay cầm xe luôn run (gia tốc > ~5mg, gyro > ~0.5 độ/s) -> cầm yên trên tay
@@ -95,11 +106,37 @@
 #define LIFT_TILT_TAU_S       0.2f        // Lọc accel khi tính nghiêng (s): bỏ qua cú tăng tốc / va chạm ngắn
 #define LIFT_VZ_MS            0.12f       // Vận tốc thẳng đứng quá mức này = bị nhấc (m/s)
 #define LIFT_VZ_TAU_S         0.3f        // Hằng số rò của tích phân vận tốc đứng (s): sai số offset không cộng dồn
-#define LIFT_CONFIRM_S        0.02f       // Điều kiện nhấc phải đúng liên tục chừng này
+// Xóc thẳng đứng mạnh (gờ sàn, va chạm): |gia tốc đứng - lúc nằm yên| > LIFT_VZ_SHOCK_G -> vận tốc đứng = 0 trong
+// LIFT_VZ_SHOCK_S. Tay nhấc không tạo gia tốc lớn vậy. Lý do: chip lắp úp, trục Z lúc nằm yên đã -1.17g, chỉ còn 0.83g
+// tới giới hạn +-2g -> cú xóc bị cắt 1 phía, tích phân vz lệch giả (mô phỏng: gờ 1mm @300mm/s giữ |vz| > 0.12 hơn 200ms)
+#define LIFT_VZ_SHOCK_G       0.5f
+#define LIFT_VZ_SHOCK_S       0.1f
+#define LIFT_TILT_RATE_DPS    30.0f       // Tốc độ lật roll + pitch (độ/s) quá mức này = tay đang nghiêng xe
+#define LIFT_TILT_RATE_YAW_DPS 80.0f      // Chỉ xét tốc độ lật khi |tốc độ quay quanh trục đứng| dưới mức này
+#define LIFT_CONFIRM_S        0.2f        // Điều kiện nhấc phải đúng LIÊN TỤC chừng này (vấp gờ ngắn hơn -> bỏ qua)
 #define LIFT_PLACE_S          1.0f        // Nằm yên chừng này mới coi là đã đặt xuống (s)
 #define LIFT_PLACE_GYRO_DPS   2.0f
 #define LIFT_PLACE_TILT_DEG   10.0f
 #define LIFT_PLACE_ACC_DEV_G  0.004f      // Độ rung |a| (TB |(|a| - TB trượt 0.1s)|): sàn ~1.5mg, tay cầm > 5mg
+// ===== VA CHẠM (Crash Detection, 22/10/2026 theo yêu cầu người dùng) =====
+// Dùng ĐỘ GIẬT = biến thiên trong CRASH_LAG_SAMPLES mẫu (10ms), KHÔNG so gia tốc tuyệt đối: PID tăng tốc / phanh gấp
+// (<= 0.2g, đổi chậm vì quán tính + DLPF accel 20Hz) không bị báo. Chỉ xét khi PID đang chạy (motor_pid_enable).
+//   - Lọc gai I2C: mỗi kênh qua trung vị 3 mẫu TRƯỚC khi tính giật. (1 mẫu hỏng tạo 2 lần giật liên tiếp - vọt lên rồi
+//     về - nên chỉ đếm "2 chu kỳ liên tiếp" thì vẫn báo nhầm)
+//   - giật ngang planar = |da.e1| + |da.e2|: e1, e2 = 2 trục NẰM NGANG theo hướng trọng lực lúc nằm trên sàn (không theo
+//     trục chip: chip lắp úp, có thể nghiêng) -> vấp gờ sàn (giật theo chiều đứng) không lọt vào
+//   - Đâm trực diện:  planar > CRASH_JERK_G
+//   - Quệt góc tường: planar > CRASH_JERK_SIDE_G và |dGz| > CRASH_GZ_JERK_DPS (đầu xe bị văng)
+//   - đúng liên tục CRASH_CONFIRM_N mẫu -> IMU_STATE_CRASHED: khóa động cơ, hủy chuyển động y như bị nhấc; chạy lại
+//     khi xe nằm yên (như đặt xuống, xem trên). Mode Manager: tạm dừng, lưu Flash, đứng im PAUSE_STILL_MS thì chạy tiếp
+// NGƯỠNG CHƯA ĐO TRÊN XE: số của người dùng (18000 / 12000 LSB ở thang ±2g = 1.10 / 0.73g), tính theo g nên không phụ
+// thuộc dải đo. Chỉnh theo cột giat / giatz của print_mpu6500() khi chạy thử, đâm thử, vấp gờ
+#define CRASH_LAG_SAMPLES     5           // So với mẫu cách 5 mẫu = 10ms (1 mẫu / 2ms)
+#define CRASH_JERK_G          1.10f       // = 18000 LSB: đâm trực diện
+#define CRASH_JERK_SIDE_G     0.73f       // = 12000 LSB: quệt (kèm đầu xe văng)
+#define CRASH_GZ_JERK_DPS     76.0f       // Đầu xe văng: Gz đổi > 76 độ/s trong 10ms (người dùng ghi 10000 LSB theo thang
+                                          // ±250 độ/s; xe dùng ±2000 độ/s 16.4 LSB/(độ/s) -> 1250 LSB)
+#define CRASH_CONFIRM_N       2           // Số mẫu liên tiếp vượt ngưỡng
 #define LED_RUN_PORT          GPIOB       // LED báo xe đang trên sàn, sẵn sàng hoạt động
 #define LED_RUN_PIN           GPIO_PIN_15
 #define LED_RUN_ON            GPIO_PIN_SET    // Mức logic làm LED sáng (LED nối ngược thì đổi 2 dòng này)
@@ -117,10 +154,16 @@ extern float gyro_x_offset, gyro_y_offset, gyro_z_offset;
 extern volatile uint8_t imu_ready;       // 1: ngắt TIM9 đang đọc IMU bằng DMA
 extern volatile uint8_t imu_still;        // 1: xe đang đứng yên (yaw giữ nguyên, offset Gz đang tự chỉnh)
 extern uint8_t mpu_whoami;                // Đọc lúc khởi tạo: 0x70 MPU6500, 0x71 lõi MPU9250
-extern volatile uint8_t robot_lifted;     // 1: xe đang bị nhấc lên (động cơ bị khóa), 0: xe trên sàn
+extern volatile uint8_t robot_lifted;     // 1: động cơ bị khóa an toàn (bị nhấc HOẶC va chạm, chờ nằm yên), 0: chạy được
+// Trạng thái an toàn IMU (lý do của robot_lifted)
+#define IMU_STATE_NORMAL      0U          // Trên sàn, chạy được
+#define IMU_STATE_PICKED_UP   1U          // Bị nhấc (gia tốc kế / encoder / IR) hoặc khởi động không hiệu chỉnh được
+#define IMU_STATE_CRASHED     2U          // Va chạm
+extern volatile uint8_t imu_state;        // IMU_STATE_*
 extern float lift_tilt_deg;               // Độ nghiêng so với lúc nằm trên sàn (độ) - để theo dõi / chỉnh ngưỡng
 extern float lift_vz_ms;                  // Vận tốc thẳng đứng ước lượng (m/s, dương = đi lên)
 extern float lift_acc_dev;                // Độ rung gia tốc (g) - nằm yên trên sàn ~0.0015
+extern float lift_tilt_rate_dps;          // Tốc độ lật roll + pitch (độ/s), so với LIFT_TILT_RATE_DPS
 
 // ===== KHỞI ĐỘNG (luồng chính) =====
 HAL_StatusTypeDef MPU6500_Init(void);
@@ -146,7 +189,8 @@ void MPU6500_Process_Data(float dt);      // Callback I2C DMA xong: tính góc
 
 // ===== DEBUG / TEST (luồng chính) =====
 // In 1 dòng giá trị MPU SAU BỘ LỌC qua USART1 (HC-05): pitch, roll, yaw, gyro x/y/z (độ/s), accel x/y/z (g),
-// nhiệt độ, cờ đứng yên. Gọi lặp trong while(1), tự giãn nhịp bằng HAL_Delay. Tiêu đề in mỗi 50 dòng
+// nhiệt độ, cờ đứng yên, các số của nhận biết nhấc xe / va chạm (nghieng, vz, rung, nhac, lat, giat, giatz, tt).
+// Gọi lặp trong while(1), người gọi tự giãn nhịp. Tiêu đề in mỗi 50 dòng
 void print_mpu6500(void);
 // Đo nhiễu IMU khi tắt PWM / PWM băm xung / bánh quay, rồi theo dõi bias gyro theo nhiệt độ
 // trong temp_seconds giây (0 = bỏ qua). KÊ BÁNH LÊN. Xong chờ máy tính mở cổng COM rồi in báo cáo.

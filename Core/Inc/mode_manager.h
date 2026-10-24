@@ -34,23 +34,23 @@
 #include "main.h"
 
 /* ===== CÒI (PB8, CubeMX: GPIO_Output) ===== */
-#define BUZZ_ON_MS               500U      /* MỖI LẦN còi kêu dài chừng này (người dùng đặt 15/10/2026, trước: 2s / 150ms) */
+#define BUZZ_ON_MS               250U      /* MỖI LẦN còi kêu dài chừng này (người dùng đặt 15/10/2026, trước: 2s / 150ms) */
 #define BUZZER_PORT              GPIOB
 #define BUZZER_PIN               GPIO_PIN_8
 #define BUZZER_ON                GPIO_PIN_SET      /* Mức làm còi kêu (còi kêu ở mức thấp thì đổi 2 dòng này) */
 #define BUZZER_OFF               GPIO_PIN_RESET
 
 /* ===== NÚT ẢO = MẮT IR TRÁI (adc_value[1], số thô như cột IRL của print_LED) ===== */
-#define UI_IR_PRESS_RAW          3000U     /* > mức này = đang nhấn (đưa tay sát mắt trái) */
-#define UI_IR_RELEASE_RAW        2000U     /* < mức này = đã bỏ tay; phải bỏ tay rồi mới nhận lần nhấn tiếp */
+#define UI_IR_PRESS_RAW          2000U     /* > mức này = đang nhấn (đưa tay sát mắt trái) */
+#define UI_IR_RELEASE_RAW        1500U     /* < mức này = đã bỏ tay; phải bỏ tay rồi mới nhận lần nhấn tiếp */
 #define UI_DEBOUNCE_MS           30U       /* Trên ngưỡng liên tục chừng này mới tính 1 lần nhấn (chống nhiễu) */
 #define UI_BEEP_MS               BUZZ_ON_MS /* Mỗi lần che: còi kêu 1 tiếng chừng này */
 #define UI_BEEP_GAP_MS           300U      /* Che lúc còi đang kêu: lặng chừng này rồi mới kêu tiếng mới (đếm được) */
 #define UI_WINDOW_MS             3000U     /* Hết còi mà chừng này không che nữa -> chốt số lần che (người dùng: 3s) */
-#define MODE_START_DELAY_MS      1000U     /* Chọn xong: chờ bỏ tay ra khỏi xe thêm chừng này rồi mới chạy */
+#define MODE_START_DELAY_MS      500U     /* Chọn xong: chờ bỏ tay ra khỏi xe thêm chừng này rồi mới chạy */
 
 /* ===== CÒI BÁO ===== */
-#define CONFIRM_LONG_BEEP_MS     1500U     /* Che 3 lần (MODE 3, luôn hợp lệ): 1 tiếng bíp dài xác nhận rồi chạy */
+#define CONFIRM_LONG_BEEP_MS     1000U     /* Che 3 lần (MODE 3, luôn hợp lệ): 1 tiếng bíp dài xác nhận rồi chạy */
 #define GOAL_BEEP_MS             BUZZ_ON_MS /* MODE 2 tới đích: kêu - nghỉ GOAL_BEEP_GAP_MS - kêu */
 #define GOAL_BEEP_GAP_MS         500U
 #define ERROR_BEEP_MS            BUZZ_ON_MS /* Lỗi ("tít tít tít"): chọn mode không hợp lệ, kẹt / lệch hướng lúc chạy... */
@@ -60,7 +60,7 @@
                                               trong Flash (phải đặt xe đúng ô, đúng hướng đó - in qua UART) */
 
 /* ===== TẠM DỪNG / CHẠY TIẾP ===== */
-#define PAUSE_STILL_MS           5000U     /* Đứng im liên tục chừng này (và IMU xác nhận đã đặt xuống) -> chạy tiếp */
+#define PAUSE_STILL_MS           3000U     /* Đứng im liên tục chừng này (và IMU xác nhận đã đặt xuống) -> chạy tiếp */
 #define PAUSE_IR_TOL             25.0f     /* 1 mắt IR (đã lọc) đổi quá max(mức này, PAUSE_IR_TOL_FRAC x giá trị) */
 #define PAUSE_IR_TOL_FRAC        0.08f     /*   -> chưa đứng im (tay còn gần, đang chỉnh xe), đếm lại từ đầu */
 #define PAUSE_ENC_TOL_MM         1.0f      /* Bánh lăn quá chừng này -> chưa đứng im */
@@ -77,7 +77,7 @@
 #define PICKUP_ENC_MS            30U
 /* 3. IR (chỉ khi đang chạy MODE): xe ĐỨNG YÊN đang thấy tường rõ mà cả 4 mắt cùng tụt về mức không tường =
  *    bị nhấc khỏi mê cung (tường không tự biến mất). Lúc đang chạy thì không dùng: đi ra chỗ trống cũng tụt */
-#define PICKUP_IR_ENABLE         1
+#define PICKUP_IR_ENABLE         0
 #define PICKUP_IR_SEEN_FRONT     300.0f    /* "Thấy tường rõ": mắt trước >= mức này ... */
 #define PICKUP_IR_SEEN_SIDE      170.0f    /* ... hoặc mắt bên >= mức này (= WALL_SIDE_PRESENT_IR) */
 #define PICKUP_IR_LOST_FRONT     130.0f    /* "Mất hết": cả 2 mắt trước < mức này VÀ ... */
@@ -90,6 +90,7 @@
 #define PICKUP_BY_IMU            0x01U
 #define PICKUP_BY_ENCODER        0x02U
 #define PICKUP_BY_IR             0x04U
+#define PICKUP_BY_CRASH          0x08U     /* IMU báo va chạm (độ giật, mpu6500.c) - xử lý như bị nhấc */
 
 /* ===== TRẠNG THÁI ===== */
 typedef enum

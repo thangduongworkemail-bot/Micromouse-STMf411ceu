@@ -36,19 +36,21 @@
 
 /* ===== TỐC ĐỘ / VÒNG KHÁM PHÁ ===== */
 #ifndef MAZE_SEARCH_SPEED_MMS
-#define MAZE_SEARCH_SPEED_MMS     300.0f     /* Tốc độ khi khám phá (người dùng tăng 250 -> 300, 14/10/2026) */
+#define MAZE_SEARCH_SPEED_MMS     400.0f     /* Tốc độ khi khám phá (người dùng tăng 250 -> 300, 14/10/2026) */
 #endif
 #ifndef MAZE_RUN_SPEED_MMS
-#define MAZE_RUN_SPEED_MMS        350.0f     /* Tốc độ chạy nhanh (giới hạn MAX_SPEED_MMS) */
+#define MAZE_RUN_SPEED_MMS        500.0f     /* Tốc độ chạy nhanh. Đi thẳng không còn chặn 350 (chỉ sức động cơ
+                                                ~500), nhưng muốn hãm kịp ở ô rẽ: v^2/(2*MOVE_DECEL) < MAZE_SENSE_BEFORE_MM
+                                                (90mm -> <= ~420 mm/s) */
 #endif
 #ifndef MAZE_MAX_ROUNDS
 #define MAZE_MAX_ROUNDS           3U         /* Số vòng khám phá tối đa (đi tâm + về) trước khi chạy nhanh */
 #endif
 #ifndef MAZE_RETURN_SPEED_MMS
-#define MAZE_RETURN_SPEED_MMS     300.0f     /* Tốc độ quay về ô xuất phát sau khi chạy nhanh */
+#define MAZE_RETURN_SPEED_MMS     400.0f     /* Tốc độ quay về ô xuất phát sau khi chạy nhanh */
 #endif
 #ifndef MAZE_TURN_TIMEOUT_MS
-#define MAZE_TURN_TIMEOUT_MS      4000U      /* Mỗi lần quay tại chỗ tối đa (kẹt bánh -> lỗi) */
+#define MAZE_TURN_TIMEOUT_MS      2500U      /* Mỗi lần quay tại chỗ tối đa (kẹt bánh -> lỗi) */
 #endif
 #ifndef MAZE_STRAIGHT_TIMEOUT_MS
 #define MAZE_STRAIGHT_TIMEOUT_MS  3000U      /* Mỗi đoạn thẳng tối đa: chừng này + 2 lần thời gian chạy ở tốc độ tối đa */

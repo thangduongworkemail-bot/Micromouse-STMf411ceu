@@ -228,17 +228,35 @@ int main(void)
   // MODE 1 khi Flash trống, MODE 2 khi Flash trống / map chưa có đường tới đích: 3 bíp lỗi, xe không chạy.
   // Bản đồ lưu Flash sector 7 (còn sau khi tắt nguồn) và gửi qua HC-05 cho maze/maze_viewer.py khi xong mỗi lượt và
   // mỗi khi máy tính gửi 1 ký tự lúc xe đứng chờ.
-  ModeManager_Init();
+//  ModeManager_Init();
   while (1)
   {
+	 // print_LED();
+	 // ModeManager_Update();             // Không chặn: gọi liên tục, KHÔNG thêm HAL_Delay vào vòng lặp này
 
-	  ModeManager_Update();             // Không chặn: gọi liên tục, KHÔNG thêm HAL_Delay vào vòng lặp này
+		  // ===== THU CUA CONG: 1 vong hinh vuong moi lan nhan phim (HC-05) =====
+		  UART_WaitStart("Dat xe o tam o giua canh, nhan phim de chay vong vuong\r\n");
+		  HAL_Delay(1000);                         // bo tay ra, xe nam yen
+		  Motion_Begin();                          // do lai gyro, lay huong + vi tri hien tai lam goc
+		  const int laps = 1;                      // so vong lien tiep (tang len de thay sai so cong don)
+		  float h0 = Robot_Heading();
+		  uint8_t ok = 1;
+		  for (int k = 0; k < 4 * laps && ok; k++) {
+			  if (!Smooth_Turn_Left_90()) ok = 0;  // Smooth_Turn_Right_90(): di chieu kim dong ho
+			  while (ok && Motion_Status() == MOTION_STATUS_RUNNING) { }
+			  if (Motion_Status() != MOTION_STATUS_DONE) ok = 0;
+		  }
+		  char buf[140];
+		  snprintf(buf, sizeof(buf), "Vong vuong: %s | xe tu tinh: lech vi tri %.1f mm (x %+.1f y %+.1f), lech huong %+.2f do\r\n",
+		           ok ? "XONG" : "DUNG GIUA CHUNG", sqrtf(odo_x_mm * odo_x_mm + odo_y_mm * odo_y_mm),
+		           odo_x_mm, odo_y_mm, Robot_Heading() - h0 - 360.0f * laps);   // cua phai: + 360 * laps
+		  UART_Print(buf);
 
-	 // Move_Straight(0.0f, 0.0f);
-	//  print_LED();
+	  Move_Straight(1000.0f, 500.0f);
+	  print_LED();
 	 
 	  // 2s để bỏ tay ra, xe nằm yên trên sàn
-	          // quay TRÁI 10 vòng theo gyro rồi dừng (âm = quay phải)
+
 
 
     /* USER CODE END WHILE */

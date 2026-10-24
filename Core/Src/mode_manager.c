@@ -159,10 +159,10 @@ static bool Wheel_Overspeed(float meas, float ref)
 uint8_t Check_Robot_Picked_Up(void)
 {
     uint8_t reason = 0U;
-    if (robot_lifted != 0U) {                      /* Đang bị nhấc (gia tốc kế, hoặc lần phát hiện trước) */
+    if (robot_lifted != 0U) {                      /* Đang bị khóa (IMU: nhấc / va chạm, hoặc lần phát hiện trước) */
         Pickup_ResetCounters();
         if (pickup_reason == 0U) {
-            pickup_reason = PICKUP_BY_IMU;
+            pickup_reason = (imu_state == IMU_STATE_CRASHED) ? PICKUP_BY_CRASH : PICKUP_BY_IMU;
         }
         return pickup_reason;
     }
@@ -379,16 +379,17 @@ static void Enter_Paused(void)
     uint8_t y;
     uint8_t h;
     uint8_t why = pickup_reason;
-    if ((why == 0U) && (robot_lifted != 0U)) {
-        why = PICKUP_BY_IMU;                       /* Gia tốc kế vừa báo, ngắt TIM9 chưa kịp ghi lý do */
+    if ((why == 0U) && (robot_lifted != 0U)) {    /* IMU vừa báo, ngắt TIM9 chưa kịp ghi lý do */
+        why = (imu_state == IMU_STATE_CRASHED) ? PICKUP_BY_CRASH : PICKUP_BY_IMU;
     }
     Maze_Pause();                                  /* Chốt ô hiện tại (đang chạy thẳng: tâm ô gần nhất), giữ bản đồ */
     Motor_Stop();
     mm_resume_to = mm_state;
     Maze_GetPose(&x, &y, &h);
-    snprintf(mm_msg, sizeof(mm_msg), "TAM DUNG (nhac xe:%s%s%s): dat lai o (%u,%u) mui huong %s, dung im %us se chay tiep\r\n",
-             (why & PICKUP_BY_IMU) ? " gia toc" : "", (why & PICKUP_BY_ENCODER) ? " encoder" : "",
-             (why & PICKUP_BY_IR) ? " IR" : "", (unsigned)x, (unsigned)y, Dir_Name(h), (unsigned)(PAUSE_STILL_MS / 1000U));
+    snprintf(mm_msg, sizeof(mm_msg), "TAM DUNG (%s%s%s%s): dat lai o (%u,%u) mui huong %s, dung im %us se chay tiep\r\n",
+             ((why & PICKUP_BY_CRASH) != 0U) ? "VA CHAM" : "nhac xe:", (why & PICKUP_BY_IMU) ? " gia toc" : "",
+             (why & PICKUP_BY_ENCODER) ? " encoder" : "", (why & PICKUP_BY_IR) ? " IR" : "",
+             (unsigned)x, (unsigned)y, Dir_Name(h), (unsigned)(PAUSE_STILL_MS / 1000U));
     UART_Print(mm_msg);
     Save_Map(FLASH_SAVE_LIFTED);                   /* Tắt nguồn lúc đang bị nhấc: lần sau MODE 1 dò tiếp được */
     Still_Restart(HAL_GetTick());

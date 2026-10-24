@@ -68,8 +68,8 @@ static const uint16_t ir_fl_ref[] = {  130,  175,  250,  350,  450,  550,  650, 
 // Bảng IRL thô -> IRR cùng khoảng cách: tường bên đặt ở 13 khoảng cách như nhau cho từng mắt (IRL.log, IRR.log
 // 10/10/2026), mỗi điểm = trung vị đoạn đứng yên cuối cùng ở khoảng cách đó (12-123 mẫu, lệch chuẩn 2-16).
 // 2 mắt bên vốn gần nhau (IRR/IRL = 0.91..1.09). Không thấy bão hòa (lớn nhất ~1270).
-static const uint16_t ir_l_raw[] = {  231,  273,  312,  356,  394,  443,  509,  621,  735,  864, 1009, 1166, 1268 };
-static const uint16_t ir_l_ref[] = {  244,  264,  308,  352,  406,  462,  556,  642,  722,  820,  929, 1060, 1179 };
+static const uint16_t ir_l_raw[] = {  231,  273,  312,  376,  394,  443,  509,  621,  735,  864, 1009, 1166, 1268 };
+static const uint16_t ir_l_ref[] = {  300,  360,  408,  432,  506,  582,  556,  642,  722,  820,  929, 1060, 1179 };
 #define IR_L_TAB_N   (sizeof(ir_l_raw) / sizeof(ir_l_raw[0]))
 
 // Nội suy tuyến tính từng đoạn trong bảng x -> y (x tăng dần, n >= 2).

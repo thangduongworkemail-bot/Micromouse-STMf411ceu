@@ -23,8 +23,8 @@
 #define MM_PER_COUNT_R        (3.14159265f * WHEEL_DIAMETER_R / ENCODER_CPR)
 #define SPEED_LPF_ALPHA      0.3f            // Hệ số lọc thông thấp vận tốc đo (0..1, nhỏ = lọc mạnh)
 #define PWM_MAX               2999            // = ARR của TIM1 và TIM5
-#define MAX_SPEED_MMS         350.0f          // Giới hạn vận tốc đặt (mm/s). Đo được: 300 mm/s đã cần ~72% PWM
-                                              // -> tối đa ~400 mm/s, chừa lại phần PWM cho PID tăng tốc/bù tải
+#define MAX_SPEED_MMS         600.0f          // Giới hạn vận tốc đặt của Motor_SetSpeed / quay / giữ hướng (mm/s).
+                                              // Move_Straight KHÔNG bị giới hạn bởi số này (xem STRAIGHT_PWM_HEADROOM)
 // ===== TEST PID (PID_Test) =====
 #define PID_TEST_STAGES       5               // Số bước thử, vận tốc từng bước ở mảng pid_test_speeds[]
 #define PID_TEST_STAGE_LEN    200             // Số mẫu mỗi bước (200 x 2ms = 0.4s)
@@ -71,11 +71,18 @@
 #define SPIN_CAL_DPS          150.0f          // Tốc độ quay (độ/s)
 #define SPIN_CAL_DECIM        5               // Ghi 1 mẫu / 5 chu kỳ 2ms (10ms ~ 1.5 độ ở 150 độ/s)
 #define SPIN_CAL_MAX          3000            // Số mẫu tối đa (12 byte/mẫu = 36KB, đủ cho 10 vòng)
-#define SPIN_CAL_MIN_CONTRAST 40.0f           // Đỉnh IR phải cao hơn nền ít nhất chừng này (số ADC) mới tin
+#define SPIN_CAL_MIN_CONTRAST 100.0f           // Đỉnh IR phải cao hơn nền ít nhất chừng này (số ADC) mới tin
 #define SPIN_CAL_WINDOW_DEG   45.0f           // Tìm đỉnh vòng sau trong +-45 độ quanh chỗ dự kiến
 #define MOVE_SPEED_MMS        250.0f          // Vận tốc đi thẳng mặc định (Rectangle_Test, ví dụ trong main)
 #define MOVE_DECEL_MMS2       1000.0f         // Gia tốc hãm dùng để tính điểm giảm tốc (< MAX_ACCEL_MMS2 để bánh kịp bám)
 #define MOVE_TOL_MM           2.0f            // Sai số quãng đường chấp nhận
+// ĐI THẲNG KHÔNG GIỚI HẠN TỐC ĐỘ (người dùng 18/10/2026): Move_Straight chạy đúng tốc độ đặt, chỉ bị chặn bởi sức
+// động cơ (~550 mm/s ở PWM_MAX theo số đo PID_Test, phụ thuộc pin). Đặt quá sức động cơ thì 2 bánh cùng hết PWM ->
+// không còn chỗ lệch tốc 2 bánh để giữ hướng (mô phỏng 1000 mm/s: lệch ngang 43mm, quệt tường bên). Nên: bánh nào
+// còn < STRAIGHT_PWM_HEADROOM tới PWM_MAX thì hạ trần vận tốc về tốc độ thật đang chạy, hết bão hòa thì nâng trần lại
+// dần theo STRAIGHT_VLIM_RISE_MMS2. Trần không xuống dưới MAX_SPEED_MMS -> đặt <= 350 chạy y như trước
+#define STRAIGHT_PWM_HEADROOM 200             // PWM chừa cho khâu sửa hướng + PID (> rung PWM đo được ~104/chu kỳ)
+#define STRAIGHT_VLIM_RISE_MMS2 300.0f        // Nâng trần lại chậm (khâu Ka nhỏ) để không vọt bão hòa lại ngay
 // PD GIỮ HƯỚNG (gyro MPU6500): dùng khi đi thẳng và khi đứng giữ hướng (Move_Straight với tốc độ 0).
 // Ra tốc độ sửa hướng w (độ/s) -> 2 bánh +-w*TRACK_WIDTH/2:
 //   w = KP*lệch - KD*tốc độ quay (gyro, lọc thông thấp HEADING_D_TAU_S)
@@ -130,7 +137,7 @@
 // đúng chỗ khó nhất; căn lệch thì đo r lúc vuông góc thật ở 1700 ghi vào WALL_R_OFFSET, hoặc hạ đích về ~1600
 #define WALL_STOP_IR          2000.0f         // GIỚI HẠN: không đi gần tường trước hơn mức này
 #define WALL_TARGET_IR        1700.0f         // Dừng / đứng cách tường trước ở mức này (< WALL_STOP_IR)
-#define WALL_SLOW_IR          300.0f          // Bắt đầu giảm tốc. > mức không có tường (FR ~20-60, FL quy đổi ~80-110)
+#define WALL_SLOW_IR          500.0f          // Bắt đầu giảm tốc. > mức không có tường (FR ~20-60, FL quy đổi ~80-110)
 #define WALL_APPROACH_MMS     80.0f           // Vận tốc lúc tới WALL_TARGET_IR (phanh từ đây trôi ~2-3mm)
 // Phanh SỚM theo tốc độ tăng của IR: dừng khi IR + (IR tăng / s) x WALL_STOP_LEAD_S >= WALL_TARGET_IR.
 // Đoạn trôi khi phanh (mm) x độ dốc IR (/mm) = IR tăng thêm -> tự đúng với mọi độ dốc IR, không cần đổi IR ra mm
@@ -146,12 +153,12 @@
 //   2 bên có tường: e = (eL + eR) / 2; 1 bên: theo bên đó; không có tường: chỉ giữ hướng gyro
 // Góc lái thêm -WALL_CENTER_KP x e (độ, kẹp WALL_CENTER_MAX_DEG) cộng vào lệnh lái của PD giữ hướng; hướng đích
 // gyro KHÔNG đổi (hệ hướng tuyệt đối giữ nguyên). Lệch ngang hội tụ theo quãng đường đi, gần như không phụ thuộc tốc độ
-#define WALL_CENTER_L_IR      240.0f          // IRL THÔ (cột IRL của print_LED) khi xe ở giữa ô
+#define WALL_CENTER_L_IR      280.0f          // IRL THÔ (cột IRL của print_LED) khi xe ở giữa ô
 #define WALL_CENTER_R_IR      280.0f          // IRR khi xe ở giữa ô
 // CÓ / KHÔNG CÓ TƯỜNG BÊN (người dùng đặt 14/10/2026): IRL thô hoặc IRR (số của print_LED, đã lọc) DƯỚI mức này = bên
 // đó KHÔNG có tường, từ mức này trở lên = có tường. Dùng chung cho cân giữa ô và giải mê cung (MAZE_SIDE_WALL_IR).
 // Giữa ô đọc 240 / 280, không tường ~40-80 -> xe lệch về phía bên kia ~10-20mm thì tường bên này coi như mất
-#define WALL_SIDE_PRESENT_IR  170.0f
+#define WALL_SIDE_PRESENT_IR  130.0f
 #define WALL_CENTER_KP        60.0f           // Độ lái thêm cho lệch tương đối 1.0 (lệch 5% khoảng cách -> 3 độ)
 #define WALL_CENTER_MAX_DEG   5.0f            // Góc lái thêm tối đa
 #define WALL_CENTER_TAU_S     0.02f           // Lọc thông thấp lệch ngang (s)
@@ -181,7 +188,7 @@
 // xong (tiến / lùi về đích, chờ đứng yên, quay thử, quay chỉnh, đo lại gyro) -> thôi căn (WS_FAIL): giữ hướng đang giữ,
 // MPU không đổi. Đứng giữ hướng thì chỉ thử lại khi mất tường rồi có lại; Wall_Align trả về 0. Sim: căn bình thường
 // 1-1.5s, phải bò tới tường ~30mm rồi căn ~2.5-3s (2500 đã cắt mất trường hợp này)
-#define WALL_ALIGN_MAX_MS     4000
+#define WALL_ALIGN_MAX_MS     2500
 #define WALL_ALIGN_TIMEOUT_MS (WALL_ALIGN_MAX_MS + 500)   // Wall_Align chờ tối đa (dự phòng, ngắt tự thôi trước)
 #define WALL_PROBE_DEG        4.0f            // Góc quay thử để đo độ nhạy g (chỉ lần đầu, hoặc sau 1 lần căn hỏng)
 #define WALL_MIN_GAIN         0.002f          // |g| nhỏ hơn (r đổi < 0.2% / độ) -> không phải tường phẳng, không căn
@@ -245,7 +252,8 @@ extern float dist_left_mm, dist_right_mm; // Quãng đường cộng dồn từ 
 extern float odo_x_mm, odo_y_mm;          // Vị trí ước lượng (encoder + gyro), gốc = lúc gọi Motion_Begin()
 void    Motion_Begin(void);               // Lấy vị trí + hướng hiện tại làm gốc (xe đứng yên), đo lại gyro (chặn ~0.5s)
 void    Motion_SetOrigin(void);           // Như Motion_Begin nhưng không đo lại gyro (không chặn)
-// Đi thẳng dist_mm (âm = lùi) với tốc độ tối đa speed_mms (giới hạn MAX_SPEED_MMS), giữ hướng bằng gyro.
+// Đi thẳng dist_mm (âm = lùi) với tốc độ tối đa speed_mms (KHÔNG giới hạn, chỉ bị chặn bởi sức động cơ, xem
+// STRAIGHT_PWM_HEADROOM), giữ hướng bằng gyro.
 // speed_mms = 0 hoặc dist_mm = 0: ĐỨNG GIỮ HƯỚNG - không đi, KHÔNG CHỜ (trả về ngay), ngắt TIM9 giữ mãi tới lệnh
 // chuyển động khác (Move_Straight đi / Turn_Angle / Motor_SetSpeed / Motor_Stop). Xoay tay lệch đi thì xe tự
 // quay về hướng cũ (theo đường ngắn nhất). Hướng giữ = hướng đích hiện tại (Motion_Begin() trước = hướng lúc đó).
@@ -285,6 +293,63 @@ uint8_t Turn_Angle_Begin(float deg);      // Như trên nhưng không chờ: the
 uint8_t Turn_Left(float deg);
 uint8_t Turn_Right(float deg);
 float   Robot_Heading(void);              // Hướng xe (độ), dương = trái, không quấn về +-180
+
+// ===== CUA CONG 90 ĐỘ (Smooth turn, 22/10/2026 - đang để ngoài floodfill để thử) =====
+// Chạy trong ngắt TIM9 (MOTION_CURVE), không chặn. Quỹ đạo tính theo QUÃNG ĐƯỜNG encoder s (không theo thời gian) ->
+// hình dạng cua không đổi khi tốc độ thật lệch tốc độ đặt. Gốc: trục bánh ở tâm 1 ô, nhìn thẳng hành lang.
+//   Pha A (tiếp cận): đi thẳng (giữ hướng gyro + cân giữa ô), hãm theo sqrt về v_cua để tới ĐẦU CUNG đúng v_cua.
+//     Đầu cung = tâm ô góc - D, D tính từ hình học quỹ đạo (không lấy biên ô). Trục còn cách tâm ô góc
+//     CURVE_SENSE_BEFORE_MM: mắt bên phía rẽ phải thấy TRỐNG (< WALL_SIDE_PRESENT_IR), không thì hủy cua, dừng ở tâm
+//     ô góc (MOTION_CURVE_BLOCKED). Tường trước gần bất thường (>= WALL_TARGET_IR) -> dừng (MOTION_WALL).
+//   Pha B (cung): độ cong theo quãng đường k(s) = (pi/L) sin^2(pi s/L), tổng góc đúng 90 độ. Độ cong VÀ tốc độ đổi độ
+//     cong đều liên tục -> gia tốc bánh không nhảy bậc (hình thang độ cong thì có). Vận tốc góc mẫu w = k(s) v,
+//     bánh: v_trai = v - w b/2, v_phai = v + w b/2 (PID vận tốc + ramp MAX_ACCEL như mọi chế độ khác, không đặt PWM).
+//     Phản hồi: hướng đích = góc mẫu theta(s) (liên tục) + sửa lệch ngang; PD hướng (HEADING_KP / KD, khâu D so với
+//     vận tốc góc mẫu). Lệch ngang = vị trí odometry (s encoder x hướng gyro) so với quỹ đạo mẫu tích phân cùng s.
+//     Góc = gyro (Robot_Heading); encoder dùng cho quãng đường / vị trí và đối chiếu: chênh góc encoder - gyro trong
+//     cung báo trượt bánh / TRACK_WIDTH sai (in trong báo cáo).
+//   Pha C (ra): độ cong về 0 trơn (sin^2) nên vận tốc góc mẫu cua -> thẳng không nhảy. Giữ hướng đích = h0 +- 90
+//     (tuyệt đối, KHÔNG reset góc). Giữ v_cua tới khi lệch hướng < CURVE_SETTLE_DEG và lệch ngang < CURVE_SETTLE_MM
+//     mới tăng tốc lại, kèm giảm tốc / dừng trước tường như đi thẳng. Xong khi đủ quãng đường + đứng yên.
+// HÌNH HỌC (scratchpad/curve/geom.py, thân 100x80, trục cách đuôi 30, ô 180, tường 12, ô góc kín trừ lối vào/ra):
+//   L (cung)  D     R_min  v_banh_trong/v  hở nhỏ nhất (mũi ngoài)
+//   120      70.1   38.2   +0.01          19.4 mm
+//   140      81.8   44.6   +0.15          21.3 mm   <- chọn: bánh trong vẫn tiến, đầu cung trước điểm đọc mắt bên (90)
+//   160      93.5   50.9   +0.25          23.1 mm      (D > 90: cung bắt đầu trước khi kịp đọc phía rẽ)
+//   < 130: bánh trong phải quay lùi (ma sát tĩnh ~470 PWM khi đổi chiều). Quay tại chỗ quét 80.6 mm từ trục.
+// VẬN TỐC CUA tự tính = nhỏ nhất của: bánh ngoài <= CURVE_WHEEL_MAX_MMS, gia tốc ngang <= CURVE_A_LAT_MAX_MMS2
+//   (bám đường), gia tốc bánh do đổi độ cong <= CURVE_A_WHEEL_MAX_MMS2 (< MAX_ACCEL_MMS2 để ramp không méo quỹ đạo).
+//   L = 140: bánh ngoài 1.85 v -> v_cua ~243 mm/s (ngang 0.13g, gia tốc bánh ~1130 mm/s2)
+#define CURVE_ARC_LEN_MM          140.0f      // Chiều dài cung (mm), xem bảng trên
+#define CURVE_CELL_MM             180.0f      // Kích thước ô (Smooth_Turn_Left_90 / Right_90: từ tâm ô tới tâm ô)
+#define CURVE_V_MAX_MMS           300.0f      // Tốc độ tối đa đoạn tiếp cận / ra mặc định
+#define CURVE_WHEEL_MAX_MMS       450.0f      // Bánh ngoài tối đa (động cơ ~500 mm/s ở PWM_MAX, chừa cho PID)
+#define CURVE_A_LAT_MAX_MMS2      3000.0f     // Gia tốc hướng tâm tối đa (~0.3g, CHƯA ĐO độ bám bánh)
+#define CURVE_A_WHEEL_MAX_MMS2    1500.0f     // Gia tốc bánh tối đa do đổi độ cong
+#define CURVE_LAT_KP_DEG_PER_MM   0.5f        // Sửa lệch ngang: độ / mm (tắt dần sau ~115mm đi)
+#define CURVE_LAT_MAX_DEG         5.0f
+#define CURVE_SENSE_BEFORE_MM     90.0f       // Đọc mắt bên phía rẽ khi trục còn cách tâm ô góc chừng này (= MAZE_SENSE_BEFORE_MM,
+                                              // mắt bên nhìn chéo ~94mm trước trục; CẦN HIỆU CHỈNH theo cách gắn mắt)
+#define CURVE_SETTLE_DEG          2.0f        // Pha C: lệch hướng / lệch ngang dưới mức này mới tăng tốc lại
+#define CURVE_SETTLE_MM           3.0f
+#define CURVE_EXIT_BLEND_MM       60.0f       // Pha C: đi được chừng này sau cung thì cân giữa ô theo tường bên (nếu có)
+#define CURVE_EXIT_ACCEL_MMS2     1000.0f     // Pha C: trần tốc độ tăng dần từ v_cua (không nhảy lên MAX_ACCEL ngay khi ra cung)
+// Sửa vị trí dọc bằng MÉP TƯỜNG BÊN phía rẽ (tường hành lang vào hết ở cột góc -> mắt bên tụt): trục cách tâm ô góc bao
+// nhiêu mm lúc mắt bên tụt. 0 = TẮT (chưa hiệu chỉnh). Hiệu chỉnh: đặt xe đúng tâm ô, chạy Smooth_Turn_Test vài lần, lấy
+// trung bình số "mep tuong ben: truc cach tam o goc ... mm" trong báo cáo
+#define CURVE_EDGE_POS_MM         0.0f
+#define CURVE_EDGE_MAX_CORR_MM    30.0f       // Sửa quá chừng này thì bỏ (đọc nhầm)
+#define CURVE_LOG_N               600         // Ghi 1 mẫu / 4ms cho báo cáo (600 x 18 byte)
+// dir: +1 trái, -1 phải. approach_mm: trục -> tâm ô góc; exit_mm: tâm ô góc -> điểm dừng trên hướng mới (đều >= D).
+// v_turn_mms <= 0: tự tính. Theo dõi bằng Motion_Status(): RUNNING -> DONE / WALL / FAIL (phía rẽ có tường, lệch hướng
+// > MOTION_ABORT_DEG, bị nhấc...). 0: không bắt đầu được
+uint8_t Smooth_Turn_Begin(int8_t dir, float approach_mm, float exit_mm, float v_turn_mms, float v_max_mms);
+uint8_t Smooth_Turn_Left_90(void);        // Từ tâm ô hiện tại: tới ô kế, cua trái, dừng ở tâm ô sau cua. Không chặn
+uint8_t Smooth_Turn_Right_90(void);
+// THỬ (chặn, ngoài floodfill): xe đứng TÂM 1 Ô, nhìn thẳng hành lang, ô góc cách cells ô phía trước (1 hoặc 2; muốn
+// đo / dùng mép tường bên thì 2: mắt chéo thấy hết tường ngay ~2mm sau tâm ô trước ô góc), mở phía rẽ. Đo lại gyro,
+// cua, in báo cáo qua UART (HC-05); print_log = 1 in thêm CSV từng 4ms (s, góc mẫu / thật, lệch ngang, vận tốc bánh)
+void    Smooth_Turn_Test(int8_t dir, uint8_t cells, float v_max_mms, uint8_t print_log);
 // NHẤC / ĐẶT XE (tự động, xem mpu6500.h): nhấc lên thì mọi lệnh chạy bị hủy / từ chối (trả 0), động cơ phanh;
 // đặt xuống nằm yên ~1s thì hướng lúc đặt = góc 0, LED PB15 sáng. Lệnh chạy dở KHÔNG tự chạy tiếp.
 void    Motion_OnLifted(void);            // Gọi trong ngắt IMU khi phát hiện bị nhấc (không gọi từ main)

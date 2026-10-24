@@ -43,15 +43,29 @@ static volatile uint32_t imu_read_fail  = 0;   // Lệnh đọc DMA bị HAL t�
 
 // ===== NHẤC XE / ĐẶT XE (xem mpu6500.h) =====
 volatile uint8_t robot_lifted = 0;
+volatile uint8_t imu_state = IMU_STATE_NORMAL;
 float lift_tilt_deg = 0.0f;
 float lift_vz_ms    = 0.0f;
 float lift_acc_dev  = 0.01f;
+float lift_tilt_rate_dps = 0.0f;
 static float   lift_acc_avg = 1.0f;      // |a| trung bình trượt ~0.1s (g), cho độ rung lift_acc_dev
 static float   lift_ref[3] = { 0.0f, 0.0f, 1.0f };  // Hướng "lên" (vector đơn vị, hệ trục chip) lúc nằm trên sàn
+static float   lift_e1[3] = { 1.0f, 0.0f, 0.0f };   // 2 trục nằm ngang vuông góc với lift_ref (Lift_SetBasis)
+static float   lift_e2[3] = { 0.0f, 1.0f, 0.0f };
+// Va chạm: trung vị 3 mẫu từng kênh (ax, ay, az theo g; Gz độ/s) + lịch sử đã lọc để lấy mẫu cách CRASH_LAG_SAMPLES
+#define CRASH_CH              4
+#define CRASH_HIST            (CRASH_LAG_SAMPLES + 1)
+static float   crash_raw[3][CRASH_CH];   // 3 mẫu thô gần nhất (vòng)
+static float   crash_hist[CRASH_HIST][CRASH_CH];   // Đã lọc trung vị (vòng)
+static uint8_t crash_i = 0, crash_h = 0; // Vị trí ghi tiếp theo của 2 vòng
+static uint8_t crash_n = 0;              // Số mẫu đã có (tới 2 + CRASH_HIST thì đủ để tính)
+static uint8_t crash_spike_count = 0;    // Số mẫu liên tiếp vượt ngưỡng va chạm
+static float   crash_jerk_peak = 0.0f, crash_gzjerk_peak = 0.0f;   // Lớn nhất từ lần in trước (print_mpu6500)
 static float   lift_ref_g  = 1.0f;       // |gia tốc| lúc nằm yên (g; chip này đọc ~1.19 vì offset accel)
 static uint8_t lift_ref_ok = 0;          // 0: chưa có hướng gốc (lấy ở mẫu đầu tiên sau MPU6500_Setup)
 static float   lift_af[3];               // Gia tốc lọc thông thấp (g) để tính nghiêng
 static float   lift_cond_t = 0.0f;       // Thời gian điều kiện "bị nhấc" đã đúng liên tục (s)
+static float   lift_shock_t = 0.0f;      // Còn bao lâu bỏ vận tốc đứng sau cú xóc (s)
 // Cửa sổ nằm yên lúc chờ đặt xuống: cộng dồn gyro thô (offset mới) + gia tốc (hướng gốc mới)
 static float    place_t, place_g[3], place_gz2, place_gz_half, place_a[3];
 static uint32_t place_n, place_n_half;
@@ -59,7 +73,7 @@ static void Lift_Update(const volatile int16_t *raw, float rate_gx, float rate_g
 
 // ===== THỐNG KÊ CHO MPU6500_Test =====
 // Callback I2C cộng dồn từng mẫu (trong ngắt), luồng chính tính trung bình / độ nhiễu khi đo xong.
-// Dùng số nguyên 64 bit: cộng bình phương az (~16384^2) x 1000 mẫu vẫn chính xác tuyệt đối.
+// Dùng số nguyên 64 bit: cộng bình phương az (~32767^2) x 1000 mẫu vẫn chính xác tuyệt đối.
 typedef struct {
     int64_t sum;
     int64_t sumsq;
@@ -105,9 +119,9 @@ HAL_StatusTypeDef MPU6500_Init(void) {
     status = HAL_I2C_Master_Transmit(&hi2c1, MPU6500_ADDR, data, 2, 100);
     if (status != HAL_OK) return status;
 
-    // 4. Accel Full Scale: ±2g -> Độ nhạy 16384 LSB/g (Xe chạy mặt phẳng không cần lớn)
+    // 4. Accel Full Scale: ACCEL_FS_CFG (±8g, ACCEL_LSB_PER_G = 4096 LSB/g) - lý do xem mpu6500.h
     data[0] = REG_ACCEL_CONFIG;
-    data[1] = 0x00;
+    data[1] = ACCEL_FS_CFG;
     status = HAL_I2C_Master_Transmit(&hi2c1, MPU6500_ADDR, data, 2, 100);
     if (status != HAL_OK) return status;
 
@@ -204,7 +218,10 @@ HAL_StatusTypeDef MPU6500_Setup(void)
     lift_vz_ms   = 0.0f;
     place_t      = 0.0f;
     place_n      = 0;
+    crash_n      = 0;
+    crash_spike_count = 0;
     robot_lifted = (status != HAL_OK);
+    imu_state    = robot_lifted ? IMU_STATE_PICKED_UP : IMU_STATE_NORMAL;
     HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, robot_lifted ? LED_RUN_OFF : LED_RUN_ON);
     imu_ready  = 1;
     return status;
@@ -310,9 +327,79 @@ static void Lift_ResetWindow(void)
     place_a[0] = place_a[1] = place_a[2] = 0.0f;
     place_gz2 = place_gz_half = 0.0f;
 }
+// Hướng "lên" lift_ref vừa đổi: dựng 2 trục nằm ngang e1 (trục x chip chiếu xuống mặt phẳng ngang), e2 = lên x e1
+static void Lift_SetBasis(void)
+{
+    const float *u = lift_ref;
+    float e[3] = { 1.0f, 0.0f, 0.0f };
+    float d = u[0];
+    float n;
+    if (fabsf(d) > 0.9f) {                // Trục x chip gần thẳng đứng: dùng trục y
+        e[0] = 0.0f;
+        e[1] = 1.0f;
+        d = u[1];
+    }
+    for (int i = 0; i < 3; i++) e[i] -= d * u[i];
+    n = sqrtf(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+    for (int i = 0; i < 3; i++) lift_e1[i] = e[i] / n;
+    lift_e2[0] = u[1] * lift_e1[2] - u[2] * lift_e1[1];
+    lift_e2[1] = u[2] * lift_e1[0] - u[0] * lift_e1[2];
+    lift_e2[2] = u[0] * lift_e1[1] - u[1] * lift_e1[0];
+}
+static float Median3(float a, float b, float c)
+{
+    return fmaxf(fminf(a, b), fminf(fmaxf(a, b), c));
+}
+// KHÓA AN TOÀN (bị nhấc / va chạm): khóa động cơ, hủy chuyển động, tắt LED PB15, chờ nằm yên (Lift_Update bước 2)
+static void Lift_Lock(uint8_t state)
+{
+    robot_lifted = 1;
+    imu_state    = state;
+    lift_cond_t  = 0.0f;
+    crash_spike_count = 0;
+    Lift_ResetWindow();
+    HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, LED_RUN_OFF);
+    Motion_OnLifted();                    // pid.c: hủy chuyển động, tắt PID, phanh 2 bánh
+}
+// VA CHẠM (xem CRASH_ ở mpu6500.h), mỗi mẫu IMU. a: gia tốc (g), gz: tốc độ quay trục Z chip đã trừ offset (độ/s)
+static void Crash_Update(const float a[3], float gz)
+{
+    const float in[CRASH_CH] = { a[0], a[1], a[2], gz };
+    float *now = crash_hist[crash_h];
+    const float *old;
+    float d[3], planar, gzj;
+    // 1. Trung vị 3 mẫu từng kênh: 1 mẫu I2C hỏng bị loại hẳn
+    for (int k = 0; k < CRASH_CH; k++) crash_raw[crash_i][k] = in[k];
+    crash_i = (uint8_t)((crash_i + 1U) % 3U);
+    for (int k = 0; k < CRASH_CH; k++) now[k] = Median3(crash_raw[0][k], crash_raw[1][k], crash_raw[2][k]);
+    // 2. Mẫu cũ nhất trong vòng lịch sử = cách CRASH_LAG_SAMPLES mẫu
+    crash_h = (uint8_t)((crash_h + 1U) % CRASH_HIST);
+    old = crash_hist[crash_h];
+    if (crash_n < 2U + CRASH_HIST) {      // Chưa đủ 3 mẫu thô + đầy vòng lịch sử (sau MPU6500_Setup)
+        crash_n++;
+        return;
+    }
+    // 3. Độ giật trong mặt phẳng ngang + độ giật Gz
+    for (int i = 0; i < 3; i++) d[i] = now[i] - old[i];
+    planar = fabsf(d[0] * lift_e1[0] + d[1] * lift_e1[1] + d[2] * lift_e1[2])
+           + fabsf(d[0] * lift_e2[0] + d[1] * lift_e2[1] + d[2] * lift_e2[2]);
+    gzj = fabsf(now[3] - old[3]);
+    if (planar > crash_jerk_peak) crash_jerk_peak = planar;
+    if (gzj > crash_gzjerk_peak) crash_gzjerk_peak = gzj;
+    // 4. Chỉ báo khi xe đang chạy bằng PID, trên sàn
+    if (robot_lifted || !lift_ref_ok || !motor_pid_enable) {
+        crash_spike_count = 0;
+        return;
+    }
+    if (planar > CRASH_JERK_G || (planar > CRASH_JERK_SIDE_G && gzj > CRASH_GZ_JERK_DPS)) {
+        if (++crash_spike_count >= CRASH_CONFIRM_N) Lift_Lock(IMU_STATE_CRASHED);
+    } else {
+        crash_spike_count = 0;
+    }
+}
 static void Lift_Update(const volatile int16_t *raw, float rate_gx, float rate_gy, float rate_gz, float dt)
 {
-    float a[3] = { raw[0] / 16384.0f, raw[1] / 16384.0f, raw[2] / 16384.0f };   // g
+    float a[3] = { raw[0] / ACCEL_LSB_PER_G, raw[1] / ACCEL_LSB_PER_G, raw[2] / ACCEL_LSB_PER_G };   // g
     float an = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
     if (an < 0.2f) return;                // Rơi tự do / đọc lỗi: không có hướng trọng lực để so
 
@@ -323,8 +410,10 @@ static void Lift_Update(const volatile int16_t *raw, float rate_gx, float rate_g
             for (int i = 0; i < 3; i++) lift_ref[i] = a[i] / an;
             lift_ref_g  = an;
             lift_ref_ok = 1;
+            Lift_SetBasis();
         }
     }
+    Crash_Update(a, rate_gz);
 
     // Nghiêng: góc giữa gia tốc đã lọc và hướng "lên" lúc nằm trên sàn
     float k = dt / (LIFT_TILT_TAU_S + dt);
@@ -341,19 +430,25 @@ static void Lift_Update(const volatile int16_t *raw, float rate_gx, float rate_g
     lift_acc_dev += ka * (fabsf(an - lift_acc_avg) - lift_acc_dev);
     // Vận tốc đứng: gia tốc theo hướng "lên" trừ trọng lực lúc nằm yên, tích phân có rò
     float a_up = a[0] * lift_ref[0] + a[1] * lift_ref[1] + a[2] * lift_ref[2] - lift_ref_g;
-    lift_vz_ms += a_up * 9.81f * dt - lift_vz_ms * dt / LIFT_VZ_TAU_S;
+    if (fabsf(a_up) > LIFT_VZ_SHOCK_G) lift_shock_t = LIFT_VZ_SHOCK_S;   // Xóc (gờ sàn / va): không phải tay nhấc
+    if (lift_shock_t > 0.0f) {
+        lift_shock_t -= dt;
+        lift_vz_ms = 0.0f;
+    } else {
+        lift_vz_ms += a_up * 9.81f * dt - lift_vz_ms * dt / LIFT_VZ_TAU_S;
+    }
+    // Tốc độ lật: gyro quanh 2 trục nằm ngang (roll + pitch theo trọng lực) + tốc độ quay quanh trục đứng
+    float w_up = rate_gx * lift_ref[0] + rate_gy * lift_ref[1] + rate_gz * lift_ref[2];
+    lift_tilt_rate_dps = fabsf(rate_gx * lift_e1[0] + rate_gy * lift_e1[1] + rate_gz * lift_e1[2])
+                       + fabsf(rate_gx * lift_e2[0] + rate_gy * lift_e2[1] + rate_gz * lift_e2[2]);
 
     if (!robot_lifted) {
-        // 1. Đang trên sàn: nghiêng nhiều hoặc bị nâng lên liên tục LIFT_CONFIRM_S -> bị nhấc
-        if (lift_ref_ok && (lift_tilt_deg > LIFT_TILT_DEG || fabsf(lift_vz_ms) > LIFT_VZ_MS)) lift_cond_t += dt;
+        // 1. Đang trên sàn: nghiêng nhiều / bị nâng lên / tay lật xe (lúc xe không tự quay nhanh), LIÊN TỤC
+        //    LIFT_CONFIRM_S -> bị nhấc. Vấp gờ sàn chỉ làm các dấu hiệu này nháy vài chục ms -> đếm lại từ 0
+        uint8_t tilting = (lift_tilt_rate_dps > LIFT_TILT_RATE_DPS) && (fabsf(w_up) < LIFT_TILT_RATE_YAW_DPS);
+        if (lift_ref_ok && (lift_tilt_deg > LIFT_TILT_DEG || fabsf(lift_vz_ms) > LIFT_VZ_MS || tilting)) lift_cond_t += dt;
         else lift_cond_t = 0.0f;
-        if (lift_cond_t >= LIFT_CONFIRM_S) {
-            robot_lifted = 1;
-            lift_cond_t  = 0.0f;
-            Lift_ResetWindow();
-            HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, LED_RUN_OFF);
-            Motion_OnLifted();            // pid.c: hủy chuyển động, tắt PID, phanh 2 bánh
-        }
+        if (lift_cond_t >= LIFT_CONFIRM_S) Lift_Lock(IMU_STATE_PICKED_UP);
         return;
     }
 
@@ -403,9 +498,11 @@ static void Lift_Update(const volatile int16_t *raw, float rate_gx, float rate_g
     }
     lift_ref_g  = mn;
     lift_ref_ok = 1;
+    Lift_SetBasis();
     lift_vz_ms  = 0.0f;
     yaw_angle   = 0.0f;
     robot_lifted = 0;
+    imu_state    = IMU_STATE_NORMAL;
     Lift_ResetWindow();
     HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, LED_RUN_ON);
     Motion_OnPlaced();                    // pid.c: hướng đích + gốc vị trí = chỗ đặt
@@ -491,11 +588,7 @@ HAL_StatusTypeDef MPU6500_ZeroGyroZ(void)
 void MPU6500_ForceLifted(void)
 {
     if (robot_lifted) return;
-    robot_lifted = 1;
-    lift_cond_t  = 0.0f;
-    Lift_ResetWindow();
-    HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, LED_RUN_OFF);
-    Motion_OnLifted();
+    Lift_Lock(IMU_STATE_PICKED_UP);
 }
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
 {
@@ -526,14 +619,18 @@ float MPU6500_Wrap360(float deg)
 //   nhiet       : nhiệt độ chip (°C) | dy: 1 = đang nhận là đứng yên (yaw giữ, offset Z tự chỉnh)
 //   nghieng, vz : độ nghiêng so với lúc nằm trên sàn (độ) và vận tốc thẳng đứng (m/s) - so với ngưỡng
 //                 LIFT_TILT_DEG / LIFT_VZ_MS | rung: độ rung gia tốc (mg), so với LIFT_PLACE_ACC_DEV_G
-//   nhac        : 1 = đang bị nhấc (động cơ khóa)
-// 9600 baud: 1 dòng ~110 ký tự mất ~115ms -> tối đa ~8 dòng/s
+//   nhac        : 1 = động cơ đang bị khóa an toàn (bị nhấc hoặc va chạm)
+//   lat         : tốc độ lật roll + pitch (độ/s), so với LIFT_TILT_RATE_DPS
+//   giat, giatz : độ giật ngang (g) / độ giật Gz (độ/s) LỚN NHẤT kể từ dòng trước, so với CRASH_JERK_G,
+//                 CRASH_JERK_SIDE_G / CRASH_GZ_JERK_DPS -> chạy thử, đâm tường, vấp gờ để chỉnh ngưỡng va chạm
+//   tt          : trạng thái IMU (0 bình thường, 1 bị nhấc, 2 va chạm)
+// 9600 baud: 1 dòng ~130 ký tự mất ~135ms -> tối đa ~7 dòng/s
 void print_mpu6500(void)
 {
     static uint16_t lines = 0;
     int16_t raw[7];
-    float pitch, roll, yaw, gz, offx, offy, tilt, vz, dev;
-    uint8_t still, lifted;
+    float pitch, roll, yaw, gz, offx, offy, tilt, vz, dev, trate, jerk, gzjerk;
+    uint8_t still, lifted, state;
 
     if (!imu_ready) {
         UART_Print("MPU chua san sang (MPU6500_Setup loi hoac chua goi)\r\n");
@@ -553,14 +650,19 @@ void print_mpu6500(void)
     vz    = lift_vz_ms;
     dev   = lift_acc_dev;
     lifted = robot_lifted;
+    trate  = lift_tilt_rate_dps;
+    jerk   = crash_jerk_peak;
+    gzjerk = crash_gzjerk_peak;
+    crash_jerk_peak = crash_gzjerk_peak = 0.0f;   // Đỉnh tính lại cho dòng sau
+    state  = imu_state;
     __enable_irq();
 
-    if (lines++ % 50 == 0) UART_Print("MPU,t_ms,pitch,roll,yaw,gx,gy,gz,ax,ay,az,nhiet,dy,nghieng,vz,rung,nhac\r\n");
-    snprintf(msg, sizeof(msg), "MPU,%lu,%+.2f,%+.2f,%.2f,%+.2f,%+.2f,%+.2f,%+.3f,%+.3f,%+.3f,%.1f,%u,%.1f,%+.3f,%.1f,%u\r\n",
+    if (lines++ % 50 == 0) UART_Print("MPU,t_ms,pitch,roll,yaw,gx,gy,gz,ax,ay,az,nhiet,dy,nghieng,vz,rung,nhac,lat,giat,giatz,tt\r\n");
+    snprintf(msg, sizeof(msg), "MPU,%lu,%+.2f,%+.2f,%.2f,%+.2f,%+.2f,%+.2f,%+.3f,%+.3f,%+.3f,%.1f,%u,%.1f,%+.3f,%.1f,%u,%.1f,%.3f,%.1f,%u\r\n",
              (unsigned long)HAL_GetTick(), pitch, roll, MPU6500_Wrap360(yaw),   // yaw in ra: 0..360
              (raw[4] - offx) / 16.4f, (raw[5] - offy) / 16.4f, gz,
-             raw[0] / 16384.0f, raw[1] / 16384.0f, raw[2] / 16384.0f,
-             raw[3] / 333.87f + 21.0f, still, tilt, vz, dev * 1000.0f, lifted);
+             raw[0] / ACCEL_LSB_PER_G, raw[1] / ACCEL_LSB_PER_G, raw[2] / ACCEL_LSB_PER_G,
+             raw[3] / 333.87f + 21.0f, still, tilt, vz, dev * 1000.0f, lifted, trate, jerk, gzjerk, state);
     UART_Print(msg);
 }
 
@@ -644,7 +746,7 @@ static float IMU_GzResidual(const IMU_Result *r)
 {
     return (r->mean[CH_GZ] - r->gz_off) / 16.4f;
 }
-// 1 dòng bảng kết quả. Gyro: độ/s (chia 16.4), accel: mg (chia 16384 x 1000)
+// 1 dòng bảng kết quả. Gyro: độ/s (chia 16.4), accel: mg (chia ACCEL_LSB_PER_G x 1000)
 static void IMU_PrintRow(const char *name, const IMU_Result *r)
 {
     snprintf(msg, sizeof(msg),
@@ -652,7 +754,7 @@ static void IMU_PrintRow(const char *name, const IMU_Result *r)
              name, IMU_TempC(r->mean[CH_TEMP]),
              IMU_GzResidual(r), r->std[CH_GZ] / 16.4f, r->p2p[CH_GZ] / 16.4f,
              r->std[CH_GX] / 16.4f, r->std[CH_GY] / 16.4f,
-             r->std[CH_AX] * 1000.0f / 16384.0f, r->std[CH_AY] * 1000.0f / 16384.0f, r->std[CH_AZ] * 1000.0f / 16384.0f,
+             r->std[CH_AX] * 1000.0f / ACCEL_LSB_PER_G, r->std[CH_AY] * 1000.0f / ACCEL_LSB_PER_G, r->std[CH_AZ] * 1000.0f / ACCEL_LSB_PER_G,
              (r->seconds > 0.0f) ? r->yaw_drift * 60.0f / r->seconds : 0.0f, r->still_pct,
              (unsigned long)r->n, (unsigned long)r->expected, (unsigned long)r->errors, r->speed_l, r->speed_r);
     CDC_Print(msg);

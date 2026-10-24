@@ -311,7 +311,11 @@ static bool     HW_StraightBegin(float mm, float speed) { return Move_Straight_B
 static void     HW_StraightSetTarget(float mm)          { Move_Straight_SetTarget(mm); }
 static float    HW_StraightTraveled(void)               { return Move_Straight_Traveled(); }
 static uint8_t  HW_MotionStatus(void)   { return Motion_Status(); }
-static bool     HW_TurnBegin(float deg) { return Turn_Angle_Begin(deg) != 0U; }   /* Dương = trái, theo dõi HW_MotionStatus */
+static bool     HW_TurnBegin(float deg) { return Turn_Angle_Begin(deg) != 0U; } /* Dương = trái, theo dõi HW_MotionStatus */
+static bool HW_SmoothTurnBegin(int8_t dir, float speed) {
+    /* Đi từ tâm ô trước -> qua tâm ô góc -> dừng ở tâm ô sau */
+    return Smooth_Turn_Begin(dir, MAZE_CELL_MM, MAZE_CELL_MM, 0.0f, speed) != 0U;
+}
 #if (MAZE_ALIGN_ON_FRONT_WALL != 0)
 static bool     HW_AlignBegin(void)     { return Wall_Align_Begin() != 0U; }      /* Căn vuông góc + khoảng cách */
 static uint8_t  HW_AlignPoll(void)      { return Wall_Align_Poll(); }             /* WALL_ALIGN_BUSY / _OK / _FAILED */
@@ -602,7 +606,9 @@ static void State_MoveStraight(void)
 {
     const float   traveled = HW_StraightTraveled();
     const uint8_t status = HW_MotionStatus();
-    const float   limit_ms = (float)MAZE_STRAIGHT_TIMEOUT_MS + ((2000.0f * (float)st_cells * MAZE_CELL_MM) / st_speed);
+    /* Tính theo tốc độ <= MAX_SPEED_MMS: đặt quá sức động cơ thì xe chạy chậm hơn số đặt (pid.c), không bị cắt ngang */
+    const float   t_speed  = (st_speed < MAX_SPEED_MMS) ? st_speed : MAX_SPEED_MMS;
+    const float   limit_ms = (float)MAZE_STRAIGHT_TIMEOUT_MS + ((2000.0f * (float)st_cells * MAZE_CELL_MM) / t_speed);
     /* 1. Có thể vượt nhiều điểm đọc 1 lúc nếu vòng lặp bị chậm (vd in UART): đọc lần lượt. Bị nhấc thì không đọc */
     while ((!HW_Lifted()) && (st_sensed < st_cells) &&
            (traveled >= ((((float)st_sensed + 1.0f) * MAZE_CELL_MM) - MAZE_SENSE_BEFORE_MM)))

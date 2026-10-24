@@ -70,16 +70,19 @@ static const float pid_test_speeds[PID_TEST_STAGES] = { 200.0f, 300.0f, 150.0f, 
 float dist_left_mm = 0.0f, dist_right_mm = 0.0f;
 float odo_x_mm = 0.0f, odo_y_mm = 0.0f;
 // MOTION_HOLD: đứng giữ hướng + lùi khỏi tường quá gần + tự căn vuông góc với tường trước (Hold_Update)
-typedef enum { MOTION_IDLE, MOTION_STRAIGHT, MOTION_TURN, MOTION_HOLD } MotionMode;
+typedef enum { MOTION_IDLE, MOTION_STRAIGHT, MOTION_TURN, MOTION_HOLD, MOTION_CURVE } MotionMode;
 // MOTION_WALL: đi thẳng bị tường trước chặn (ngắt đặt) / đã căn xong (Wall_Align đặt)
+// MOTION_CURVE_BLOCKED: cua cong hủy vì phía rẽ có tường, xe dừng ở tâm ô góc
 typedef enum { MOTION_OK, MOTION_RUNNING, MOTION_ABORT, MOTION_TIMEOUT, MOTION_NOT_READY, MOTION_LIFTED,
-               MOTION_WALL, MOTION_WALL_FAIL } MotionResult;
+               MOTION_WALL, MOTION_WALL_FAIL, MOTION_CURVE_BLOCKED } MotionResult;
 static volatile MotionMode   motion_mode   = MOTION_IDLE;
 static volatile MotionResult motion_result = MOTION_OK;
 static volatile float heading_target   = 0.0f;   // Hướng cần giữ / cần quay tới (độ, TUYỆT ĐỐI -> sai số không cộng dồn)
 static volatile float move_start_mm    = 0.0f;   // Quãng đường tâm xe lúc bắt đầu đoạn đi thẳng
 static volatile float move_target_mm   = 0.0f;
 static volatile float move_speed_mms   = MOVE_SPEED_MMS;   // Tốc độ tối đa của đoạn đi thẳng đang chạy
+static float straight_vlim  = MOVE_SPEED_MMS;   // Trần vận tốc theo sức động cơ (Straight_SpeedCeiling)
+static float straight_vpeak = 0.0f;             // Vận tốc đặt (sau ramp) lớn nhất đã đạt trong đoạn đi thẳng này
 static volatile uint8_t move_wall      = 0;      // 1: đoạn đi thẳng này dừng trước tường + tránh tường bên
 static volatile float motion_abort_deg = MOTION_ABORT_DEG;
 static volatile float motion_max_err   = 0.0f;   // Báo cáo: đi thẳng = |lệch hướng| lớn nhất, quay = góc vượt quá đích lớn nhất
@@ -379,11 +382,31 @@ static float Motion_Profile(float remaining, float v_max, float decel)
 static float Wall_SpeedLimit(float front)
 {
     float v_max = move_speed_mms, v_min = WALL_APPROACH_MMS;
-    if (front <= WALL_SLOW_IR || v_max <= v_min) return v_max;
+    if (front <= WALL_SLOW_IR) return v_max;
+    // Đặt nhanh hơn MAX_SPEED_MMS: động cơ có thể không chạy tới move_speed_mms -> dựng đường hãm từ vận tốc đã đạt
+    // thật. Dựng theo số đặt (vd 1000 trong khi xe chỉ chạy ~550) thì hãm quá muộn: mô phỏng đâm tường
+    if (v_max > MAX_SPEED_MMS) v_max = fmaxf(MAX_SPEED_MMS, straight_vpeak);
+    if (v_max <= v_min) return v_max;
     float u_t = 1.0f / sqrtf(WALL_TARGET_IR), u_s = 1.0f / sqrtf(WALL_SLOW_IR);
     float frac = (1.0f / sqrtf(front) - u_t) / (u_s - u_t);   // 1: ở WALL_SLOW_IR, 0: ở WALL_TARGET_IR
     if (frac < 0.0f) frac = 0.0f;
     return sqrtf(v_min * v_min + (v_max * v_max - v_min * v_min) * frac);
+}
+// Trần vận tốc đi thẳng theo SỨC ĐỘNG CƠ (xem STRAIGHT_PWM_HEADROOM, pid.h), gọi mỗi 2ms lúc đang đi thẳng.
+// Bánh nào gần hết PWM: trần = vận tốc thật đang chạy (không dưới MAX_SPEED_MMS); không thì nâng trần dần tới số đặt
+static float Straight_SpeedCeiling(void)
+{
+    const int32_t pl = (pwm_left  >= 0) ? pwm_left  : -pwm_left;
+    const int32_t pr = (pwm_right >= 0) ? pwm_right : -pwm_right;
+    float ref;
+    if (((pl > pr) ? pl : pr) >= (PWM_MAX - STRAIGHT_PWM_HEADROOM)) {
+        straight_vlim = fminf(straight_vlim, fmaxf(0.5f * fabsf(speed_left_mms + speed_right_mms), MAX_SPEED_MMS));
+    } else {
+        straight_vlim = fminf(straight_vlim + STRAIGHT_VLIM_RISE_MMS2 * CONTROL_DT, move_speed_mms);
+    }
+    ref = 0.5f * fabsf(ref_speed_left + ref_speed_right);
+    if (ref > straight_vpeak) straight_vpeak = ref;
+    return straight_vlim;
 }
 // Cân giữa ô (đi thẳng tới, xem WALL_CENTER_ ở pid.h): góc lái thêm (độ, dương = sang trái) từ 2 mắt bên.
 // v: vận tốc đặt hiện tại, front: mắt trước gần hơn. Không có tường bên / tường trước quá gần: 0 (chỉ giữ hướng gyro)
@@ -689,6 +712,190 @@ static void Hold_Update(float head_err, float w_pd, float fl, float fr, float fr
         break;
     }
 }
+// ===== CUA CONG 90 ĐỘ (MOTION_CURVE, xem CURVE_ ở pid.h) =====
+#define CV_PI                 3.14159265f
+#define RAD2DEG               (180.0f / CV_PI)
+typedef enum { CV_APPROACH, CV_ARC, CV_EXIT, CV_STOP } CurvePhase;   // CV_STOP: phía rẽ có tường, dừng ở tâm ô góc
+static volatile uint8_t cv_phase = CV_APPROACH;
+static float   cv_dir = 1.0f;            // +1 trái, -1 phải
+static float   cv_start, cv_h0;          // Quãng đường + hướng đích (độ) lúc bắt đầu
+static float   cv_L, cv_D;               // Chiều dài cung, đầu cung cách tâm ô góc (mm)
+static float   cv_s_sense, cv_s_arc0, cv_s_arc1, cv_s_end, cv_s_corner;   // Các mốc quãng đường (mm)
+static float   cv_v_turn, cv_v_max;
+static float   cv_v_cap;                 // Pha C / dừng: trần tốc độ, tăng dần sau khi ổn định
+static float   cv_s_prev, cv_x, cv_y, cv_xr, cv_yr;   // Vị trí thật (odometry) / mẫu, hệ lúc bắt đầu: x tới, y trái (mm)
+static float   cv_elat;                  // Lệch ngang so với quỹ đạo mẫu (mm, dương = lệch trái)
+static float   cv_wff_f;                 // Vận tốc góc mẫu đã lọc như heading_rate_f (khâu D)
+static uint8_t cv_checked, cv_blocked, cv_settled, cv_side_prev, cv_edge_seen;
+static float   cv_s_edge, cv_edge_corr;
+static float   cv_enc0, cv_gyro0;        // Lúc vào cung: góc theo encoder / gyro (độ) -> cv_slip lúc ra cung
+// Thống kê cho báo cáo
+static float   cv_err_max, cv_elat_max, cv_wheel_max, cv_slip, cv_err_exit;
+// Log cho Smooth_Turn_Test: 1 mẫu / 2 chu kỳ (4ms)
+typedef struct {
+    int16_t s, th_ref, th, elat;          // s, elat: 0.1mm; th_ref, th: 0.1 độ so với h0
+    int16_t vl_ref, vr_ref, vl, vr;       // mm/s
+    int16_t w_ff;                         // độ/s
+} CurveLog;
+static CurveLog cv_log[CURVE_LOG_N];
+static volatile uint16_t cv_log_n = CURVE_LOG_N;   // = CURVE_LOG_N: không ghi
+static uint8_t cv_log_div = 0;
+
+// Góc mẫu (rad, 0..pi/2) và độ cong (1/mm) theo u = (s - đầu cung) / L, profile sin^2
+static float Curve_Theta(float u)
+{
+    return 0.5f * CV_PI * u - 0.25f * sinf(2.0f * CV_PI * u);
+}
+static float Curve_Kappa(float u)
+{
+    float s = sinf(CV_PI * u);
+    return (CV_PI / cv_L) * s * s;
+}
+// Khoảng cách đầu cung -> tâm ô góc dọc hành lang vào (= tâm ô góc -> cuối cung dọc hành lang ra, đối xứng)
+static float Curve_D(float L)
+{
+    float sum = 0.0f;
+    for (int i = 0; i < 100; i++) sum += cosf(Curve_Theta((i + 0.5f) / 100.0f));
+    return L * sum / 100.0f;
+}
+// Mắt bên phía rẽ thấy tường (cùng ngưỡng / thang với Wall_CenterOffset)
+static uint8_t Curve_TurnSideWall(void)
+{
+    if (cv_dir > 0.0f) return IR_L_Filt() >= IR_L_ToRef((uint16_t)WALL_SIDE_PRESENT_IR);
+    return IR_R_Filt() >= WALL_SIDE_PRESENT_IR;
+}
+// Mỗi 2ms trong Motion_Update: ra v, w (độ/s). Trả 1 = tới điểm dừng, 0 = đang chạy, 2 = đã dừng vì tường trước
+static uint8_t Curve_Update(float front, float front_rate, float *v_out, float *w_out)
+{
+    const float s  = Robot_Distance() - cv_start;
+    const float ds = s - cv_s_prev;
+    float u, th_rel, kappa = 0.0f, v, lat_deg = 0.0f;
+    uint8_t arrived = 0;
+    cv_s_prev = s;
+
+    // 1. PHA A: mép tường bên phía rẽ (hiệu chỉnh vị trí dọc nếu đã đo CURVE_EDGE_POS_MM), kiểm tra phía rẽ trống
+    if (cv_phase == CV_APPROACH) {
+        uint8_t wall = Curve_TurnSideWall();
+        if (!cv_edge_seen && cv_side_prev && !wall && s > cv_s_arc0 - 2.0f * CURVE_CELL_MM) {
+            cv_edge_seen = 1;
+            cv_s_edge = s;
+            if (CURVE_EDGE_POS_MM > 0.0f) {
+                float corr = (s + CURVE_EDGE_POS_MM) - cv_s_corner;   // Tâm ô góc thật lệch so với tính theo encoder
+                if (fabsf(corr) <= CURVE_EDGE_MAX_CORR_MM && s < cv_s_arc0 + corr) {
+                    cv_edge_corr = corr;
+                    cv_s_corner += corr; cv_s_sense += corr; cv_s_arc0 += corr; cv_s_arc1 += corr; cv_s_end += corr;
+                }
+            }
+        }
+        cv_side_prev = wall;
+        if (!cv_checked && s >= cv_s_sense) {
+            cv_checked = 1;
+            if (wall) {                                   // Phía rẽ có tường: không cua, dừng ở tâm ô góc
+                cv_blocked = 1;
+                cv_phase   = CV_STOP;
+                cv_s_end   = cv_s_corner;
+            }
+        }
+        if (cv_phase == CV_APPROACH && s >= cv_s_arc0) {
+            cv_phase  = CV_ARC;
+            cv_enc0   = (dist_right_mm - dist_left_mm) / TRACK_WIDTH_MM * RAD2DEG;
+            cv_gyro0  = Robot_Heading();
+        }
+    }
+    if (cv_phase == CV_ARC && s >= cv_s_arc1) {
+        cv_phase = CV_EXIT;
+        cv_slip  = ((dist_right_mm - dist_left_mm) / TRACK_WIDTH_MM * RAD2DEG - cv_enc0) - (Robot_Heading() - cv_gyro0);
+    }
+
+    // 2. HƯỚNG MẪU theo quãng đường (liên tục qua 3 pha), độ cong chỉ khác 0 trong cung
+    u = (cv_phase == CV_STOP) ? 0.0f : (s - cv_s_arc0) / cv_L;
+    if (u < 0.0f) u = 0.0f;
+    if (u > 1.0f) u = 1.0f;
+    th_rel = Curve_Theta(u);
+    if (cv_phase == CV_ARC) kappa = Curve_Kappa(u);
+    heading_target = cv_h0 + cv_dir * th_rel * RAD2DEG;
+
+    // 3. VẬN TỐC TÂM XE theo quãng đường
+    if (cv_phase == CV_APPROACH) {
+        v = fminf(cv_v_max, sqrtf(cv_v_turn * cv_v_turn + 2.0f * MOVE_DECEL_MMS2 * fmaxf(cv_s_arc0 - s, 0.0f)));
+    } else if (cv_phase == CV_ARC) {
+        v = cv_v_turn;
+    } else {
+        float err = fabsf(heading_target - Robot_Heading());
+        if (cv_phase == CV_EXIT && !cv_settled && err < CURVE_SETTLE_DEG && fabsf(cv_elat) < CURVE_SETTLE_MM) cv_settled = 1;
+        if (cv_phase == CV_EXIT && cv_settled) cv_v_cap = fminf(cv_v_cap + CURVE_EXIT_ACCEL_MMS2 * CONTROL_DT, cv_v_max);
+        v = fminf(cv_v_cap, sqrtf(2.0f * MOVE_DECEL_MMS2 * fmaxf(cv_s_end - s, 0.0f)));
+        if (cv_phase == CV_EXIT) cv_err_exit = heading_target - Robot_Heading();
+        arrived = (cv_s_end - s) < MOVE_TOL_MM;
+        if (arrived) v = 0.0f;
+    }
+    // Tường trước (không xét trong cung: mắt trước đang quét ngang)
+    if (wall_guard && cv_phase != CV_ARC && v > 0.0f) {
+        if (front + fmaxf(front_rate, 0.0f) * WALL_STOP_LEAD_S >= WALL_TARGET_IR) {
+            motion_mode   = MOTION_IDLE;
+            motion_result = cv_blocked ? MOTION_CURVE_BLOCKED : MOTION_WALL;   // Đã hủy cua: dừng trước tường ô góc
+            target_speed_left = target_speed_right = 0.0f;
+            return 2;
+        }
+        if (cv_phase == CV_EXIT) v = fminf(v, Wall_SpeedLimit(front));
+    }
+
+    // 4. VỊ TRÍ: odometry thật (s encoder x hướng gyro) và quỹ đạo mẫu, cùng s, hệ lúc bắt đầu -> lệch ngang
+    {
+        const float a  = (Robot_Heading() - cv_h0) * DEG2RAD;
+        const float ar = (heading_target - cv_h0) * DEG2RAD;
+        float ex, ey;
+        cv_x  += ds * cosf(a);
+        cv_y  += ds * sinf(a);
+        cv_xr += ds * cosf(ar);
+        cv_yr += ds * sinf(ar);
+        ex = cv_x - cv_xr;
+        ey = cv_y - cv_yr;
+        cv_elat = -ex * sinf(ar) + ey * cosf(ar);
+    }
+
+    // 5. SỬA LỆCH NGANG (cộng vào hướng đích lái, không vào hướng mẫu): tiếp cận / dừng = cân giữa ô theo tường bên như đi
+    //    thẳng; cung + đầu pha ra = về quỹ đạo mẫu theo odometry; pha ra đủ CURVE_EXIT_BLEND_MM = theo tường bên nếu có
+    if (cv_phase == CV_APPROACH || cv_phase == CV_STOP) {
+        if (wall_center && v > 0.0f) lat_deg = Wall_CenterOffset(v, front);
+    } else {
+        float c = 0.0f;
+        lat_deg = Clamp(-CURVE_LAT_KP_DEG_PER_MM * cv_elat, CURVE_LAT_MAX_DEG);
+        if (cv_phase == CV_EXIT && s - cv_s_arc1 > CURVE_EXIT_BLEND_MM && wall_center && v > 0.0f) c = Wall_CenterOffset(v, front);
+        else wall_center_e = 0.0f;
+        if (c != 0.0f) lat_deg = c;
+    }
+
+    // 6. VẬN TỐC GÓC = mẫu k(s) v (theo vận tốc tâm đang đặt cho bánh, sau ramp) + PD hướng (khâu D so với mẫu)
+    {
+        const float v_ref = 0.5f * (ref_speed_left + ref_speed_right);
+        const float w_ff  = cv_dir * kappa * v_ref * RAD2DEG;
+        const float err   = heading_target + lat_deg - Robot_Heading();
+        cv_wff_f += (CONTROL_DT / (HEADING_D_TAU_S + CONTROL_DT)) * (w_ff - cv_wff_f);
+        *w_out = w_ff + Clamp(HEADING_KP * err - HEADING_KD * (heading_rate_f - cv_wff_f), HEADING_MAX_DPS);
+        *v_out = v;
+
+        // 7. Thống kê + log
+        if (fabsf(heading_target - Robot_Heading()) > cv_err_max) cv_err_max = fabsf(heading_target - Robot_Heading());
+        if (cv_phase != CV_APPROACH && fabsf(cv_elat) > cv_elat_max) cv_elat_max = fabsf(cv_elat);
+        if (fabsf(target_speed_left) > cv_wheel_max) cv_wheel_max = fabsf(target_speed_left);
+        if (fabsf(target_speed_right) > cv_wheel_max) cv_wheel_max = fabsf(target_speed_right);
+        if (cv_log_n < CURVE_LOG_N && ++cv_log_div >= 2) {
+            CurveLog *r = &cv_log[cv_log_n++];
+            cv_log_div = 0;
+            r->s      = (int16_t)(s * 10.0f);
+            r->th_ref = (int16_t)((heading_target - cv_h0) * 10.0f);
+            r->th     = (int16_t)((Robot_Heading() - cv_h0) * 10.0f);
+            r->elat   = (int16_t)(cv_elat * 10.0f);
+            r->vl_ref = (int16_t)ref_speed_left;
+            r->vr_ref = (int16_t)ref_speed_right;
+            r->vl     = (int16_t)speed_left_mms;
+            r->vr     = (int16_t)speed_right_mms;
+            r->w_ff   = (int16_t)w_ff;
+        }
+    }
+    return arrived;
+}
 static void Motion_Update(void)
 {
     static uint16_t settle_ticks = 0;
@@ -732,6 +939,7 @@ static void Motion_Update(void)
         arrived = fabsf(remaining) < MOVE_TOL_MM;
         if (!arrived) {
             v = Motion_Profile(remaining, move_speed_mms, MOVE_DECEL_MMS2);
+            v = Clamp(v, Straight_SpeedCeiling());        // Đặt quá sức động cơ: chừa PWM để còn lái được
             if (move_wall && v > 0.0f) {
                 // Tường trước: sắp tới WALL_TARGET_IR (tính cả đoạn trôi khi phanh) thì dừng (PID giảm tốc theo
                 // MAX_ACCEL rồi phanh), luồng chính căn tường
@@ -752,6 +960,11 @@ static void Motion_Update(void)
             else wall_center_e = 0.0f;
             w_dps = Clamp(w_pd, HEADING_MAX_DPS);
         }
+    } else if (motion_mode == MOTION_CURVE) {
+        // Cua cong: tiếp cận -> cung -> ra (Curve_Update tự đặt hướng đích theo quãng đường)
+        uint8_t r = Curve_Update(front, front_rate, &v, &w_dps);
+        if (r == 2) return;                       // Dừng vì tường trước
+        arrived = r;
     } else if (motion_mode == MOTION_HOLD) {
         // Đứng giữ hướng + tường trước (Hold_Update). Không bao giờ xong: giữ tới lệnh chuyển động khác
         arrived = 0;
@@ -762,15 +975,21 @@ static void Motion_Update(void)
     }
 
     // Quay trái (w > 0): bánh phải nhanh hơn bánh trái. Tới đích thì đặt đúng 0 -> PID phanh hẳn
+    // Đi thẳng không giới hạn MAX_SPEED_MMS (trần theo sức động cơ đã áp ở trên)
     float dv = w_dps * DEG2RAD * TRACK_WIDTH_MM * 0.5f;
-    target_speed_left  = Clamp(v - dv, MAX_SPEED_MMS);
-    target_speed_right = Clamp(v + dv, MAX_SPEED_MMS);
+    if (motion_mode == MOTION_STRAIGHT || motion_mode == MOTION_CURVE) {
+        target_speed_left  = v - dv;
+        target_speed_right = v + dv;
+    } else {
+        target_speed_left  = Clamp(v - dv, MAX_SPEED_MMS);
+        target_speed_right = Clamp(v + dv, MAX_SPEED_MMS);
+    }
 
     // Xong: đã tới đích và 2 bánh đứng yên liên tục MOTION_SETTLE_MS (dừng mà trôi quá đích thì sửa tiếp)
     if (arrived && fabsf(speed_left_mms) < MOTION_STOP_MMS && fabsf(speed_right_mms) < MOTION_STOP_MMS) {
         if (++settle_ticks >= MOTION_SETTLE_MS / 2) {
+            motion_result = (motion_mode == MOTION_CURVE && cv_blocked) ? MOTION_CURVE_BLOCKED : MOTION_OK;
             motion_mode   = MOTION_IDLE;
-            motion_result = MOTION_OK;
         }
     } else {
         settle_ticks = 0;
@@ -850,14 +1069,16 @@ static uint32_t Straight_Prepare(float dist_mm, float speed_mms)
     move_start_mm    = Robot_Distance();
     move_target_mm   = dist_mm;
     move_speed_mms   = speed_mms;
+    straight_vlim    = speed_mms;
+    straight_vpeak   = 0.0f;
     move_wall        = wall_guard && dist_mm > 0.0f;   // Chỉ có mắt trước: lùi thì không xét tường
     motion_abort_deg = MOTION_ABORT_DEG;
-    return MOTION_TIMEOUT_MS + (uint32_t)(2000.0f * fabsf(dist_mm) / speed_mms);
+    // Thời gian tính theo tốc độ <= MAX_SPEED_MMS: đặt quá sức động cơ thì xe chạy chậm hơn số đặt, không bị cắt ngang
+    return MOTION_TIMEOUT_MS + (uint32_t)(2000.0f * fabsf(dist_mm) / fminf(speed_mms, MAX_SPEED_MMS));
 }
 uint8_t Move_Straight(float dist_mm, float speed_mms)
 {
-    speed_mms = fabsf(speed_mms);
-    if (speed_mms > MAX_SPEED_MMS) speed_mms = MAX_SPEED_MMS;
+    speed_mms = fabsf(speed_mms);                 // Không giới hạn tốc độ (chỉ sức động cơ, Straight_SpeedCeiling)
     if (speed_mms < 1.0f || fabsf(dist_mm) < MOVE_TOL_MM) {
         // Tốc độ 0 hoặc quãng đường 0: ĐỨNG GIỮ HƯỚNG + tường trước (lùi khi IR > WALL_STOP_IR, tự căn vuông góc,
         // đặt lại MPU), chạy nền trong ngắt, không chờ. Đang giữ rồi thì để yên -> gọi lặp trong while(1) được
@@ -903,6 +1124,52 @@ uint8_t Turn_Angle_Begin(float deg)
 uint8_t Turn_Left(float deg)  { return Turn_Angle(deg); }
 uint8_t Turn_Right(float deg) { return Turn_Angle(-deg); }
 
+// ===== CUA CONG 90 ĐỘ: bắt đầu (không chờ), xem pid.h =====
+uint8_t Smooth_Turn_Begin(int8_t dir, float approach_mm, float exit_mm, float v_turn_mms, float v_max_mms)
+{
+    const float L = CURVE_ARC_LEN_MM, kmax = CV_PI / L, dk = kmax * kmax;   // Độ cong / tốc độ đổi độ cong lớn nhất
+    const float D = Curve_D(L);
+    float vt;
+    if (dir == 0 || approach_mm < D + 1.0f || exit_mm < D) return 0;   // Không đủ chỗ cho cung
+    // Vận tốc cua: bánh ngoài, bám đường (gia tốc ngang), gia tốc bánh do đổi độ cong
+    vt = CURVE_WHEEL_MAX_MMS / (1.0f + kmax * TRACK_WIDTH_MM * 0.5f);
+    vt = fminf(vt, sqrtf(CURVE_A_LAT_MAX_MMS2 / kmax));
+    vt = fminf(vt, sqrtf(CURVE_A_WHEEL_MAX_MMS2 / (0.5f * TRACK_WIDTH_MM * dk)));
+    if (v_turn_mms > 0.0f) vt = fminf(vt, v_turn_mms);
+    if (!heading_set) Motion_SetOrigin();
+    Motor_SetSpeed(0.0f, 0.0f);                   // Bật PID vận tốc, hủy lệnh đang chạy
+    cv_dir      = (dir > 0) ? 1.0f : -1.0f;
+    cv_L        = L;
+    cv_D        = D;
+    cv_v_turn   = vt;
+    cv_v_max    = fmaxf(fabsf(v_max_mms), vt);
+    cv_v_cap    = vt;
+    cv_start    = Robot_Distance();
+    cv_h0       = heading_target;                 // Hướng TUYỆT ĐỐI đang giữ (không lấy hướng đo -> không reset góc)
+    cv_s_corner = approach_mm;
+    cv_s_arc0   = approach_mm - D;
+    cv_s_arc1   = cv_s_arc0 + L;
+    cv_s_end    = cv_s_arc1 + (exit_mm - D);
+    cv_s_sense  = fminf(approach_mm - CURVE_SENSE_BEFORE_MM, cv_s_arc0 - 1.0f);
+    cv_phase    = CV_APPROACH;
+    cv_s_prev = cv_x = cv_y = cv_xr = cv_yr = cv_elat = cv_wff_f = 0.0f;
+    cv_checked = cv_blocked = cv_settled = cv_edge_seen = 0;
+    cv_side_prev = Curve_TurnSideWall();
+    cv_s_edge = cv_edge_corr = 0.0f;
+    cv_err_max = cv_elat_max = cv_wheel_max = cv_slip = cv_err_exit = 0.0f;
+    move_speed_mms   = cv_v_max;                  // Wall_SpeedLimit ở pha ra
+    motion_abort_deg = MOTION_ABORT_DEG;
+    return Motion_Start(MOTION_CURVE);
+}
+uint8_t Smooth_Turn_Left_90(void)
+{
+    return Smooth_Turn_Begin(1, CURVE_CELL_MM, CURVE_CELL_MM, 0.0f, CURVE_V_MAX_MMS);
+}
+uint8_t Smooth_Turn_Right_90(void)
+{
+    return Smooth_Turn_Begin(-1, CURVE_CELL_MM, CURVE_CELL_MM, 0.0f, CURVE_V_MAX_MMS);
+}
+
 // ===== ĐI THẲNG KHÔNG CHỜ (solving_maze.c: chạy liên tục nhiều ô, kéo dài / rút ngắn đoạn đang chạy) =====
 // Cùng chế độ MOTION_STRAIGHT với Move_Straight (PD giữ hướng gyro, hãm theo quãng còn lại, dừng trước tường, tránh
 // tường bên) nhưng trả về ngay. Luồng chính đọc quãng đã đi, đổi đích bất cứ lúc nào: ngắt TIM9 tính lại vận tốc theo
@@ -910,8 +1177,7 @@ uint8_t Turn_Right(float deg) { return Turn_Angle(-deg); }
 // Không tự căn tường khi xong (Move_Straight có), không giới hạn thời gian (người gọi tự kiểm tra)
 uint8_t Move_Straight_Begin(float dist_mm, float speed_mms)
 {
-    speed_mms = fabsf(speed_mms);
-    if (speed_mms > MAX_SPEED_MMS) speed_mms = MAX_SPEED_MMS;
+    speed_mms = fabsf(speed_mms);                 // Không giới hạn tốc độ, như Move_Straight
     if (speed_mms < 1.0f) return 0;
     (void)Straight_Prepare(dist_mm, speed_mms);
     return Motion_Start(MOTION_STRAIGHT);
@@ -1121,7 +1387,8 @@ static const char *const motion_result_str[] = { "OK", "dang chay", "HUY: lech h
                                                  "HUY: qua thoi gian (ket banh?)", "HUY: chua san sang",
                                                  "HUY: xe bi nhac len",
                                                  "DUNG TRUOC TUONG: da can vuong goc, dat lai huong MPU",
-                                                 "HUY: dung truoc tuong nhung khong can vuong goc duoc" };
+                                                 "HUY: dung truoc tuong nhung khong can vuong goc duoc",
+                                                 "HUY CUA: phia re co tuong, dung o tam o goc" };
 void Rectangle_Test(float length_mm, float width_mm)
 {
     MotionSeg seg[8];
@@ -1385,4 +1652,76 @@ void Gyro_Spin_Calibrate(uint8_t turns)
              err ? " (theo gyro CHUA hieu chinh -> co the lech)" : "");
     UART_Print(msg);
     UART_Print("================ HET ================\r\n");
+}
+
+// ===== THỬ CUA CONG 90 ĐỘ (ngoài floodfill, xem pid.h) =====
+// Xe đứng TÂM 1 ô, nhìn thẳng hành lang; ô góc cách 'cells' ô phía trước, mở phía rẽ. Đứng yên 1s, đo lại gyro, cua
+// (tiếp cận -> rẽ -> dừng ở tâm ô sau cua), rồi in báo cáo qua UART (HC-05, không cần cáp USB)
+void Smooth_Turn_Test(int8_t dir, uint8_t cells, float v_max_mms, uint8_t print_log)
+{
+    const float sgn = (dir > 0) ? 1.0f : -1.0f;
+    const float approach = (float)((cells > 0U) ? cells : 1U) * CURVE_CELL_MM;
+    uint32_t t0, ms;
+    MotionResult result;
+    if (!motor_hw_ok || !imu_ready) {
+        UART_Print("LOI: dong co bi khoa (CubeMX) hoac IMU chua san sang - khong chay duoc\r\n");
+        return;
+    }
+    Motor_SetSpeed(0.0f, 0.0f);
+    HAL_Delay(1000);
+    Motion_Begin();
+    cv_log_div = 0;
+    cv_log_n   = 0;                               // Bắt đầu ghi log
+    t0 = HAL_GetTick();
+    if (!Smooth_Turn_Begin(dir, approach, CURVE_CELL_MM, 0.0f, v_max_mms)) {
+        cv_log_n = CURVE_LOG_N;
+        UART_Print("LOI: khong bat dau cua duoc (xe bi nhac / chua san sang / khong du cho)\r\n");
+        return;
+    }
+    while (Motion_Status() == MOTION_STATUS_RUNNING && HAL_GetTick() - t0 < 10000U) {
+    }
+    ms = HAL_GetTick() - t0;
+    if (Motion_Status() == MOTION_STATUS_RUNNING) {
+        Motor_SetSpeed(0.0f, 0.0f);
+        motion_result = MOTION_TIMEOUT;
+    }
+    result = motion_result;
+    cv_log_n = (cv_log_n < CURVE_LOG_N) ? cv_log_n : CURVE_LOG_N;
+    {
+        const uint16_t n = cv_log_n;
+        cv_log_n = CURVE_LOG_N;                   // Dừng ghi
+
+        UART_Print("\r\n================ TEST CUA CONG 90 ================\r\n");
+        snprintf(msg, sizeof(msg), "Cua %s: %s | %lu ms | cung L %.0f mm, bat dau %.1f mm truoc tam o goc, R min %.1f mm\r\n",
+                 (dir > 0) ? "TRAI" : "PHAI",
+                 (result == MOTION_WALL) ? "DUNG TRUOC TUONG (IR >= WALL_TARGET_IR, khong can)" : motion_result_str[result],
+                 (unsigned long)ms, cv_L, cv_D, cv_L / CV_PI);
+        UART_Print(msg);
+        snprintf(msg, sizeof(msg), "Van toc: cua %.0f mm/s (tu tinh), tiep can / ra toi da %.0f | banh nhanh nhat %.0f mm/s\r\n",
+                 cv_v_turn, cv_v_max, cv_wheel_max);
+        UART_Print(msg);
+        snprintf(msg, sizeof(msg), "Huong (gyro): lech luc dung %+.2f do | lech lon nhat %.2f do | encoder - gyro trong cung %+.1f do\r\n",
+                 cv_err_exit, cv_err_max, cv_slip);
+        UART_Print(msg);
+        snprintf(msg, sizeof(msg), "Vi tri (odometry, he luc dau, x toi / y trai): %.1f / %+.1f mm (dich %.1f / %+.1f) | lech ngang lon nhat %.1f mm\r\n",
+                 cv_x, cv_y, approach, sgn * CURVE_CELL_MM, cv_elat_max);
+        UART_Print(msg);
+        if (cv_edge_seen) {
+            snprintf(msg, sizeof(msg), "Mep tuong ben phia re: truc cach tam o goc %.1f mm (-> CURVE_EDGE_POS_MM)%s\r\n",
+                     cv_s_corner - cv_edge_corr - cv_s_edge, (cv_edge_corr != 0.0f) ? " | da sua vi tri" : "");
+        } else {
+            snprintf(msg, sizeof(msg), "Mep tuong ben phia re: khong thay (hanh lang vao khong co tuong phia re)\r\n");
+        }
+        UART_Print(msg);
+        if (print_log) {
+            UART_Print("CUA,s_mm,goc_mau,goc,lech_ngang_mm,vtrai_dat,vphai_dat,vtrai,vphai,w_mau\r\n");
+            for (uint16_t i = 0; i < n; i++) {
+                const CurveLog *r = &cv_log[i];
+                snprintf(msg, sizeof(msg), "CUA,%.1f,%.1f,%.1f,%.1f,%d,%d,%d,%d,%d\r\n", r->s / 10.0f, r->th_ref / 10.0f,
+                         r->th / 10.0f, r->elat / 10.0f, r->vl_ref, r->vr_ref, r->vl, r->vr, r->w_ff);
+                UART_Print(msg);
+            }
+        }
+        UART_Print("================ HET ================\r\n");
+    }
 }
